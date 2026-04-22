@@ -17,7 +17,7 @@ The closest available orthomosaic in terms of season and tide state is **fall 20
 
 ## What I Did
 
-I extracted each polygon's footprint on the 2021 ortho and generated per-polygon chips showing the bank context. Chips are available here: [link].
+I extracted each polygon's footprint on the 2021 ortho and generated per-polygon chips showing the bank context. Chips are available in the shape_chips folder in this repository.
 
 Two quantitative notes:
 
