@@ -21,7 +21,7 @@ I extracted each polygon's footprint on the 2021 ortho and generated per-polygon
 
 Two quantitative notes:
 
-- Across all 15 polygons, there are roughly **15,000 pixels** of 27e-labeled area on the ortho.
+- Across all 15 polygons, there are roughly **27,000 pixels** of 27e-labeled area on the ortho.
 - This would be the entire training signal available if we used this data for a pixel-based classifier (e.g., random forest).
 
 ## Findings and Concerns
