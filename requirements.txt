@@ -3,3 +3,4 @@ albumentations
 rasterio
 geopandas
 shapely
+ipython>=8.13
