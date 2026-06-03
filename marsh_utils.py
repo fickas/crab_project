@@ -607,3 +607,58 @@ def compute_channel_stats(train_patches, stats_path, force=False):
         print(f"  channel {c}: mean={m:.4f}, std={s:.4f}, n={counts[c]:,}")
 
     return means.astype(np.float32), stds.astype(np.float32)
+
+def compute_channel_stats(patches, output_path, skip_if_exists=True):
+    """
+    Compute per-channel mean and std over a list of patches, streaming
+    through them one at a time so the full set never has to fit in memory.
+    NaN values (from NDVI/NDRE no-data) are ignored, with valid-pixel
+    counts tracked per channel.
+
+    If output_path already exists and skip_if_exists=True, loads and
+    returns the cached values without recomputing.
+
+    Returns (mean_array, std_array), each shape (C,).
+    """
+    if skip_if_exists and os.path.exists(output_path):
+        print(f"  loading cached stats from {output_path}")
+        with open(output_path) as f:
+            stats = json.load(f)
+        return np.array(stats['mean']), np.array(stats['std'])
+
+    if not patches:
+        raise ValueError("No patches provided")
+
+    C = patches[0]['image'].shape[0]
+
+    # Float64 accumulators — guard against cumulative FP error at scale
+    sum_c    = np.zeros(C, dtype=np.float64)
+    sum_sq_c = np.zeros(C, dtype=np.float64)
+    n_valid  = np.zeros(C, dtype=np.int64)
+
+    for p in patches:
+        img = p['image'].astype(np.float64)               # (C, H, W)
+        sum_c    += np.nansum(img,        axis=(1, 2))
+        sum_sq_c += np.nansum(img ** 2,   axis=(1, 2))
+        n_valid  += np.sum(~np.isnan(img), axis=(1, 2))
+
+    if np.any(n_valid == 0):
+        bad = np.where(n_valid == 0)[0].tolist()
+        raise ValueError(f"No valid pixels in channel(s) {bad} — all NaN?")
+
+    means = sum_c / n_valid
+    # Variance = E[X^2] - E[X]^2; clamp tiny negatives from FP error
+    vars_ = np.maximum(sum_sq_c / n_valid - means ** 2, 0.0)
+    stds  = np.sqrt(vars_)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, 'w') as f:
+        json.dump({
+            'mean':           means.tolist(),
+            'std':            stds.tolist(),
+            'n_patches':      len(patches),
+            'n_valid_pixels': n_valid.tolist(),
+        }, f, indent=2)
+    print(f"  saved stats to {output_path}")
+
+    return means, stds
