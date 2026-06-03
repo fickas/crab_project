@@ -1161,3 +1161,131 @@ def channel_permutation_importance(model, loader, num_classes, classes_of_intere
         }
 
     return results
+
+import numpy as np
+import torch
+
+
+def _per_class_iou_on_loader(model, loader, num_classes, ignore_index, device,
+                             perturb_channel=None, rng=None):
+    """Per-class IoU on a loader. If perturb_channel is given, that channel is
+    shuffled across the batch dim before each forward pass."""
+    intersection = np.zeros(num_classes, dtype=np.int64)
+    union        = np.zeros(num_classes, dtype=np.int64)
+
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            if isinstance(batch, dict):
+                images = batch['image']
+                targets = batch.get('mask') or batch.get('target') or batch.get('label')
+            else:
+                images, targets = batch[0], batch[1]
+            images, targets = images.to(device), targets.to(device)
+
+            if perturb_channel is not None:
+                B = images.shape[0]
+                images = images.clone()
+                if B > 1:
+                    perm = torch.randperm(B, generator=rng, device=device)
+                    images[:, perturb_channel] = images[perm, perturb_channel]
+                else:
+                    # batch size 1 fallback: shuffle pixels within the single patch
+                    band = images[0, perturb_channel].flatten()
+                    idx = torch.randperm(band.numel(), generator=rng, device=device)
+                    images[0, perturb_channel] = band[idx].reshape_as(images[0, perturb_channel])
+
+            preds = model(images).argmax(dim=1)
+            valid = (targets != ignore_index)
+            for c in range(num_classes):
+                p = (preds == c) & valid
+                t = (targets == c) & valid
+                intersection[c] += (p & t).sum().item()
+                union[c]        += (p | t).sum().item()
+
+    return np.where(union > 0, intersection / np.maximum(union, 1), np.nan)
+
+
+def channel_permutation_importance_per_class(
+    model, val_loader, num_classes,
+    ignore_index=255, n_repeats=3, device='cuda', seed=42,
+    class_names=None, band_names=None,
+):
+    """Per-class permutation importance.
+
+    For each (channel, repeat): shuffle that channel across the batch
+    dimension (preserves the channel's marginal distribution, breaks its
+    correlation with labels and with the other channels), recompute per-class
+    IoU on the val set, and record the drop vs. baseline.
+
+    Returns dict with:
+        baseline_iou : (num_classes,)            per-class IoU with intact inputs
+        drops        : (n_channels, num_classes, n_repeats)
+        drops_mean   : (n_channels, num_classes)
+        drops_std    : (n_channels, num_classes)
+        band_names   : list[str]                 channel labels used in print
+        class_names  : list[str]                 class labels used in print
+    """
+    # baseline
+    baseline = _per_class_iou_on_loader(model, val_loader, num_classes,
+                                        ignore_index, device)
+
+    # channel count from a sample batch
+    first = next(iter(val_loader))
+    sample_img = first['image'] if isinstance(first, dict) else first[0]
+    n_channels = sample_img.shape[1]
+
+    master = np.random.default_rng(seed)
+    drops = np.zeros((n_channels, num_classes, n_repeats), dtype=np.float64)
+
+    for ch in range(n_channels):
+        for rep in range(n_repeats):
+            gen = torch.Generator(device=device).manual_seed(int(master.integers(2**31)))
+            after = _per_class_iou_on_loader(model, val_loader, num_classes,
+                                             ignore_index, device,
+                                             perturb_channel=ch, rng=gen)
+            drops[ch, :, rep] = baseline - after
+
+    drops_mean = drops.mean(axis=2)
+    drops_std  = drops.std(axis=2)
+
+    # name lookups
+    if class_names is None:
+        cnames = [f"class{c}" for c in range(num_classes)]
+    elif hasattr(class_names, 'get'):
+        cnames = [class_names.get(c, f"class{c}") for c in range(num_classes)]
+    else:
+        cnames = [class_names[c] if c < len(class_names) else f"class{c}"
+                  for c in range(num_classes)]
+    if band_names is None:
+        bnames = [f"ch{ch}" for ch in range(n_channels)]
+    else:
+        bnames = list(band_names)
+        while len(bnames) < n_channels:
+            bnames.append(f"ch{len(bnames)}")
+
+    # ---- print summary ----
+    print("Baseline per-class IoU:")
+    for c, name in enumerate(cnames):
+        v = baseline[c]
+        print(f"  {name:20s} {('  nan' if np.isnan(v) else f'{v:.4f}')}")
+    print()
+    print(f"Per-class permutation drops (mean ± std over {n_repeats} repeats):")
+    print(f"  {'channel':>12s}  " + "  ".join(f"{n[:14]:>14s}" for n in cnames))
+    for ch in range(n_channels):
+        cells = []
+        for c in range(num_classes):
+            if np.isnan(drops_mean[ch, c]):
+                cells.append("           nan")
+            else:
+                cells.append(f"{drops_mean[ch,c]:+.3f}±{drops_std[ch,c]:.3f}")
+        print(f"  {bnames[ch]:>12s}  " + "  ".join(f"{c:>14s}" for c in cells))
+
+    return {
+        'baseline_iou': baseline,
+        'drops':        drops,
+        'drops_mean':   drops_mean,
+        'drops_std':    drops_std,
+        'band_names':   bnames,
+        'class_names':  cnames,
+    }
