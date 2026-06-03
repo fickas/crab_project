@@ -509,3 +509,101 @@ def summarize_patches(patches, class_names=None, ignore_value=255):
         n_ignore = sum(int((p['mask'] == ignore_value).sum()) for p in split_patches)
         print(f"  ignore (255)           {n_ignore:>12,} ({100*n_ignore/total_pixels:5.2f}%)")
         print()
+
+def compute_channel_stats(train_patches, stats_path, force=False):
+    """
+    Compute per-channel mean and std for image normalization.
+
+    Streams sum / sum-of-squares in float64 with NaN-aware skipping (important
+    for index bands like NDVI, where pixels with tiny denominators are NaN).
+    Caches the result to `stats_path` as JSON; reloads on subsequent calls
+    unless `force=True`.
+
+    `train_patches` can be any iterable that yields, per item, one of:
+      - a dict with key 'image' (or 'img', 'x'),
+      - a (image, mask) tuple/list,
+      - an object with an .image attribute,
+      - a bare (C, H, W) numpy ndarray.
+    Torch tensors are auto-converted to numpy.
+
+    Returns (channel_means, channel_stds) as float32 arrays of length C.
+    """
+    if not force and os.path.exists(stats_path):
+        with open(stats_path) as f:
+            d = json.load(f)
+        print(f"Loaded cached channel stats from {stats_path}")
+        for c, (m, s) in enumerate(zip(d['means'], d['stds'])):
+            print(f"  channel {c}: mean={m:.4f}, std={s:.4f}")
+        return (np.asarray(d['means'], dtype=np.float32),
+                np.asarray(d['stds'],  dtype=np.float32))
+
+    sums = sumsq = counts = None
+    n_seen = 0
+    try:
+        total = len(train_patches)
+    except TypeError:
+        total = None
+
+    for item in train_patches:
+        img = None
+        if isinstance(item, dict):
+            for k in ('image', 'img', 'x'):
+                if k in item:
+                    img = item[k]; break
+        elif isinstance(item, (tuple, list)) and len(item) > 0:
+            img = item[0]
+        elif hasattr(item, 'image'):
+            img = item.image
+        elif isinstance(item, np.ndarray):
+            img = item
+        if img is None:
+            raise TypeError(f"Don't know how to extract image from {type(item).__name__}")
+
+        if hasattr(img, 'detach'):                  # torch.Tensor → numpy
+            img = img.detach().cpu().numpy()
+        img = np.asarray(img, dtype=np.float64)
+        if img.ndim == 2:
+            img = img[np.newaxis]
+        elif img.ndim != 3:
+            raise ValueError(f"Expected (C,H,W) or (H,W); got {img.shape}")
+
+        if sums is None:
+            C = img.shape[0]
+            sums   = np.zeros(C, dtype=np.float64)
+            sumsq  = np.zeros(C, dtype=np.float64)
+            counts = np.zeros(C, dtype=np.int64)
+
+        for c in range(img.shape[0]):
+            band = img[c].ravel()
+            valid = np.isfinite(band)
+            if not valid.any():
+                continue
+            v = band[valid]
+            sums[c]   += v.sum()
+            sumsq[c]  += (v * v).sum()
+            counts[c] += v.size
+
+        n_seen += 1
+        if total and n_seen % max(1, total // 10) == 0:
+            print(f"  {n_seen}/{total} patches...")
+
+    if sums is None:
+        raise ValueError("compute_channel_stats: no patches provided")
+
+    means = sums / np.maximum(counts, 1)
+    var   = sumsq / np.maximum(counts, 1) - means ** 2
+    stds  = np.sqrt(np.maximum(var, 0.0))
+
+    os.makedirs(os.path.dirname(stats_path) or '.', exist_ok=True)
+    with open(stats_path, 'w') as f:
+        json.dump({
+            'means': means.tolist(),
+            'stds':  stds.tolist(),
+            'n_pixels_per_channel': counts.tolist(),
+            'n_patches': n_seen,
+        }, f, indent=2)
+    print(f"Saved channel stats → {stats_path}")
+    for c, (m, s) in enumerate(zip(means, stds)):
+        print(f"  channel {c}: mean={m:.4f}, std={s:.4f}, n={counts[c]:,}")
+
+    return means.astype(np.float32), stds.astype(np.float32)
