@@ -184,6 +184,10 @@ def ensure_indices(
     print("NDRE:")
     compute_normalized_difference_raster(source_path, ndre_path, nir_band, re_band)
 
+    paths[ndvi_key] = ndvi_path     # ← add these
+    paths[ndre_key] = ndre_path     # ←
+    return paths   
+
 def inspect_raster(path):
     """Print basic info about a raster file."""
     if not os.path.exists(path):
