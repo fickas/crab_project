@@ -554,9 +554,9 @@ def compute_channel_stats(patches, output_path, skip_if_exists=True):
         if (i+1) % max(1, len(patches)//10) == 0:
             print(f"  {i+1}/{len(patches)} patches...")
         img = p['image']
-       if hasattr(img, 'detach'):
+        if hasattr(img, 'detach'):
            img = img.detach().cpu().numpy()
-       img = img.astype(np.float64)
+        img = img.astype(np.float64)
         sum_c    += np.nansum(img,        axis=(1, 2))
         sum_sq_c += np.nansum(img ** 2,   axis=(1, 2))
         n_valid  += np.sum(~np.isnan(img), axis=(1, 2))
