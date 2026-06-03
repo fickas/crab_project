@@ -74,6 +74,8 @@ from torch.utils.data import Dataset
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.cuda.amp import autocast, GradScaler
+
 #==============================================================
 
 def recommended_batch_size():
@@ -737,3 +739,40 @@ class IoUMetric:
         of_interest = [c for c in self.classes_of_interest if self.union[c] > 0]
         mean_iou = iou_per_class[of_interest].mean().item() if of_interest else 0.0
         return iou_per_class, mean_iou
+
+
+#Training and validation step functions (this is where AMP lands)
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
+    model.train()
+    total_loss, n_batches = 0.0, 0
+    for images, masks in loader:
+        images = images.to(device, non_blocking=True)
+        masks  = masks.to(device,  non_blocking=True)
+        optimizer.zero_grad()
+        with autocast():
+            logits = model(images)
+            loss   = criterion(logits, masks)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        total_loss += loss.item()
+        n_batches  += 1
+    return total_loss / n_batches
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, metric, device):
+    model.eval()
+    total_loss, n_batches = 0.0, 0
+    metric.reset()
+    for images, masks in loader:
+        images = images.to(device, non_blocking=True)
+        masks  = masks.to(device,  non_blocking=True)
+        with autocast():
+            logits = model(images)
+            loss   = criterion(logits, masks)
+        total_loss += loss.item()
+        metric.update(logits, masks)
+        n_batches  += 1
+    iou_per_class, mean_iou = metric.compute()
+    return total_loss / n_batches, iou_per_class, mean_iou
