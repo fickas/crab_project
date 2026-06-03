@@ -284,7 +284,7 @@ def build_patches_with_splits_multi(
     patch_size=256,
     overlap=0.5,
     block_size_m=100,
-    class_col=Config.CLASS_COLUMN,
+    class_col='Class',
     ignore_value=255,
     priority=None,
     train_frac=0.7,
@@ -712,7 +712,7 @@ class CombinedLoss(nn.Module):
 #Per-class IoU metric (also ignore-aware)
 class IoUMetric:
     def __init__(self, num_classes, ignore_index=255, classes_of_interest=None):
-        self.num_classes = Config.N_CLASSES
+        self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.classes_of_interest = (
             list(range(num_classes)) if classes_of_interest is None
@@ -1044,12 +1044,12 @@ def config_to_dict(config_cls):
         k: v for k, v in vars(config_cls).items() if not k.startswith('_')
     }
 
-def save_training_artifacts(output_dir, model, channel_means, channel_stds, training_summary):
+def save_training_artifacts(output_dir, model, channel_means, channel_stds, training_summary,cfg):
     os.makedirs(output_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(output_dir, 'model.pt'))
 
     bundle = {
-        'config':         config_to_dict(Config),
+        'config':         config_to_dict(cfg),
         'normalization': {
             'mean': [float(x) for x in channel_means],
             'std':  [float(x) for x in channel_stds],
