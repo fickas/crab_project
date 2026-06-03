@@ -256,3 +256,178 @@ def assign_blocks_to_splits(block_ids, train_frac=0.7, val_frac=0.15, seed=42):
         else:
             assignment[block] = 'test'
     return assignment
+
+def _grids_match(src1, src2):
+    """True iff two rasters share CRS, transform, and dimensions."""
+    return (
+        src1.crs == src2.crs
+        and src1.transform == src2.transform
+        and src1.width == src2.width
+        and src1.height == src2.height
+    )
+
+
+def build_patches_with_splits_multi(
+    paths,
+    band_spec,
+    polygons_gdf,
+    patch_size=256,
+    overlap=0.5,
+    block_size_m=100,
+    class_col=Config.CLASS_COLUMN,
+    ignore_value=255,
+    priority=None,
+    train_frac=0.7,
+    val_frac=0.15,
+    seed=42,
+    require_labels=True,
+    resampling=Resampling.bilinear,
+):
+    """
+    Multi-raster patch extractor with spatial split assignment.
+
+    Args:
+        paths: dict mapping logical names to file paths.
+        band_spec: list of (path_key, band_index) tuples, in stack order.
+            Example: [("pan_orthomosaic", 1),
+                      ("pansharp_ms", 5),
+                      ("pansharp_ms", 4)]    # = pan, NIR, RE
+        polygons_gdf: GeoDataFrame of labeled polygons; reprojected if needed.
+        patch_size, overlap, block_size_m: as in single-raster version.
+        class_col, ignore_value, priority: as in single-raster version.
+        train_frac, val_frac, seed: as in single-raster version.
+        require_labels: skip patches with zero labeled pixels.
+        resampling: rasterio Resampling enum used by WarpedVRT when a
+            raster's grid doesn't match the reference raster's grid.
+            Reference grid = the first raster in band_spec.
+
+    Yields:
+        dict per patch with keys:
+            image:            (C, H, W) ndarray, C = len(band_spec)
+            mask:             (H, W) uint8 ndarray
+            window:           rasterio Window in reference-raster coords
+            transform:        affine transform for this patch
+            labeled_fraction: float in [0, 1]
+            split:            'train' / 'val' / 'test'
+            block_id:         (block_x, block_y) tuple
+    """
+    if not band_spec:
+        raise ValueError("band_spec must contain at least one entry")
+
+    stride = max(1, int(patch_size * (1 - overlap)))
+
+    # Unique raster paths in the order they first appear in band_spec
+    raster_paths_ordered = []
+    for key, _ in band_spec:
+        p = paths[key]
+        if p not in raster_paths_ordered:
+            raster_paths_ordered.append(p)
+
+    # Resolve band_spec keys to actual paths for downstream code
+    band_spec_resolved = [(paths[key], idx) for key, idx in band_spec]
+
+    with ExitStack() as stack:
+        # First raster defines the reference grid
+        ref_path = raster_paths_ordered[0]
+        ref_src = stack.enter_context(rasterio.open(ref_path))
+
+        sources = {ref_path: ref_src}
+
+        # Open remaining rasters, wrap in WarpedVRT if their grid differs
+        for p in raster_paths_ordered[1:]:
+            src = stack.enter_context(rasterio.open(p))
+            if _grids_match(src, ref_src):
+                sources[p] = src
+            else:
+                sources[p] = stack.enter_context(WarpedVRT(
+                    src,
+                    crs=ref_src.crs,
+                    transform=ref_src.transform,
+                    width=ref_src.width,
+                    height=ref_src.height,
+                    resampling=resampling,
+                ))
+
+        # Project polygons to the reference CRS
+        if polygons_gdf.crs != ref_src.crs:
+            polygons_gdf = polygons_gdf.to_crs(ref_src.crs)
+
+        # Priority ordering: higher-priority classes rasterized last (win overlaps)
+        if priority is not None:
+            rank = {c: i for i, c in enumerate(priority)}
+            gdf = polygons_gdf.copy()
+            gdf['_rank'] = gdf[class_col].map(lambda c: rank.get(c, len(priority)))
+            gdf = gdf.sort_values('_rank', ascending=False)
+        else:
+            gdf = polygons_gdf
+
+        shapes = list(zip(gdf.geometry, gdf[class_col].astype(np.uint8)))
+
+        # Group requested bands by raster path so we read each raster once per patch
+        bands_by_path = {}
+        for path, band_idx in band_spec_resolved:
+            bands_by_path.setdefault(path, []).append(band_idx)
+
+        h, w = ref_src.height, ref_src.width
+
+        # First pass: enumerate patch locations and their blocks
+        patch_locations = []
+        patch_blocks = []
+        for row in range(0, h - patch_size + 1, stride):
+            for col in range(0, w - patch_size + 1, stride):
+                center_row = row + patch_size // 2
+                center_col = col + patch_size // 2
+                x_world, y_world = ref_src.xy(center_row, center_col)
+                block = get_block_id(x_world, y_world, block_size_m)
+                patch_locations.append((row, col))
+                patch_blocks.append(block)
+
+        block_to_split = assign_blocks_to_splits(
+            patch_blocks, train_frac, val_frac, seed
+        )
+
+        # Second pass: read aligned windows from each raster, stack, rasterize mask
+        for (row, col), block in zip(patch_locations, patch_blocks):
+            window = Window(col, row, patch_size, patch_size)
+            window_transform = ref_src.window_transform(window)
+
+            # Read all needed bands from each raster in one read per raster
+            arrays_by_key = {}
+            for path, band_indices in bands_by_path.items():
+                src = sources[path]
+                arr = src.read(band_indices, window=window)  # (n_bands, H, W)
+                for i, b in enumerate(band_indices):
+                    arrays_by_key[(path, b)] = arr[i]
+
+            # Stack in band_spec order
+            image = np.stack(
+                [arrays_by_key[(path, b)] for path, b in band_spec_resolved],
+                axis=0,
+            )
+
+            # Rasterize mask
+            if shapes:
+                mask = rasterize(
+                    shapes,
+                    out_shape=(patch_size, patch_size),
+                    transform=window_transform,
+                    fill=ignore_value,
+                    dtype=np.uint8,
+                )
+            else:
+                mask = np.full((patch_size, patch_size), ignore_value, dtype=np.uint8)
+
+            labeled_fraction = float((mask != ignore_value).mean())
+
+            if require_labels and labeled_fraction == 0:
+                continue
+
+            yield {
+                'image': image,
+                'mask': mask,
+                'window': window,
+                'transform': window_transform,
+                'labeled_fraction': labeled_fraction,
+                'split': block_to_split[block],
+                'block_id': block,
+            }
