@@ -191,3 +191,33 @@ def inspect_raster(path):
     paths[ndre_key] = ndre_path
     return paths
 
+def visualize_orthomosaic_sample(path, window_size_m=10):
+    """Show a random window from the orthomosaic."""
+    with rasterio.open(path) as src:
+        # Get a center window
+        cx = (src.bounds.left + src.bounds.right) / 2
+        cy = (src.bounds.bottom + src.bounds.top) / 2
+
+        # Calculate window in pixels
+        pixels_per_meter = 1 / src.res[0]
+        window_pixels = int(window_size_m * pixels_per_meter)
+
+        # Convert coords to pixel offsets
+        py, px = src.index(cx, cy)
+        window = ((py - window_pixels//2, py + window_pixels//2),
+                  (px - window_pixels//2, px + window_pixels//2))
+
+        img = src.read(window=window)
+
+        # Display
+        if img.shape[0] == 3:
+            img = np.moveaxis(img, 0, -1)
+            img = (img - img.min()) / (img.max() - img.min() + 1e-6)
+        else:
+            img = img[0]
+
+        plt.figure(figsize=(10, 10))
+        plt.imshow(img, cmap='gray' if img.ndim == 2 else None)
+        plt.title(f"{window_size_m}m × {window_size_m}m sample @ ({cx:.1f}, {cy:.1f})")
+        plt.axis('off')
+        plt.show()
