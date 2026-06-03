@@ -66,6 +66,9 @@ from rasterio.vrt import WarpedVRT
 from rasterio.enums import Resampling
 from contextlib import ExitStack
 
+
+from torch.utils.data import Dataset
+
 #==============================================================
 
 def recommended_batch_size():
@@ -431,3 +434,33 @@ def build_patches_with_splits_multi(
                 'split': block_to_split[block],
                 'block_id': block,
             }
+
+
+
+class MarshSegmentationDataset(Dataset):
+    """
+    Holds a list of patch dicts and serves (image_tensor, mask_tensor) pairs.
+    Applies an albumentations pipeline if provided.
+    """
+    def __init__(self, patches, augmentation=None):
+        self.patches = patches
+        self.augmentation = augmentation
+
+    def __len__(self):
+        return len(self.patches)
+
+    def __getitem__(self, idx):
+        p = self.patches[idx]
+        # rasterio gives (C, H, W); albumentations wants (H, W, C)
+        image = p['image'].transpose(1, 2, 0).astype(np.float32)
+        mask = p['mask'].astype(np.int64)
+
+        if self.augmentation is not None:
+            augmented = self.augmentation(image=image, mask=mask)
+            image = augmented['image']
+            mask = augmented['mask']
+
+        # back to (C, H, W) tensor
+        image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float()
+        mask_tensor = torch.from_numpy(mask).long()
+        return image_tensor, mask_tensor
