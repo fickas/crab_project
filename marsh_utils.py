@@ -706,3 +706,34 @@ class CombinedLoss(nn.Module):
     def forward(self, logits, targets):
         return self.ce_weight * self.ce(logits, targets) \
              + self.dice_weight * self._dice(logits, targets)
+
+#Per-class IoU metric (also ignore-aware)
+class IoUMetric:
+    def __init__(self, num_classes, ignore_index=255, classes_of_interest=None):
+        self.num_classes = Config.N_CLASSES
+        self.ignore_index = ignore_index
+        self.classes_of_interest = (
+            list(range(num_classes)) if classes_of_interest is None
+            else list(classes_of_interest)
+        )
+        self.reset()
+
+    def reset(self):
+        self.inter = torch.zeros(self.num_classes, dtype=torch.float64)
+        self.union = torch.zeros(self.num_classes, dtype=torch.float64)
+
+    @torch.no_grad()
+    def update(self, logits, targets):
+        preds = logits.argmax(dim=1)
+        valid = (targets != self.ignore_index)
+        for c in range(self.num_classes):
+            p = (preds == c) & valid
+            t = (targets == c) & valid
+            self.inter[c] += (p & t).sum().double().cpu()
+            self.union[c] += (p | t).sum().double().cpu()
+
+    def compute(self):
+        iou_per_class = self.inter / (self.union + 1e-7)
+        of_interest = [c for c in self.classes_of_interest if self.union[c] > 0]
+        mean_iou = iou_per_class[of_interest].mean().item() if of_interest else 0.0
+        return iou_per_class, mean_iou
