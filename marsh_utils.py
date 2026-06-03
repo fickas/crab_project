@@ -776,3 +776,40 @@ def validate(model, loader, criterion, metric, device):
         n_batches  += 1
     iou_per_class, mean_iou = metric.compute()
     return total_loss / n_batches, iou_per_class, mean_iou
+
+#the training driver
+def train(model, train_loader, val_loader, criterion, optimizer, scheduler,
+          num_epochs, num_classes, ignore_index=255,
+          ckpt_path=None,
+          device='cuda', class_names=None):
+    scaler = GradScaler()
+    metric = IoUMetric(num_classes=6, classes_of_interest=[3, 4, 5])
+    best_iou = 0.0
+
+    for epoch in range(num_epochs):
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler, device)
+        val_loss, iou_per_class, mean_iou = validate(model, val_loader, criterion, metric, device)
+        if scheduler is not None:
+            scheduler.step()
+
+        per_class_str = ', '.join(
+            f"{(class_names or {}).get(c, c)}={iou_per_class[c].item():.3f}"
+            for c in range(num_classes)
+        )
+        print(f"Epoch {epoch+1:3d}/{num_epochs}  "
+              f"train_loss={train_loss:.4f}  "
+              f"val_loss={val_loss:.4f}  "
+              f"val_mIoU={mean_iou:.4f}  |  {per_class_str}")
+
+        if mean_iou > best_iou:
+            best_iou = mean_iou
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_iou': best_iou,
+                'iou_per_class': iou_per_class.tolist(),
+            }, ckpt_path)
+            print(f"  → saved checkpoint  (val_mIoU={mean_iou:.4f})")
+
+    return best_iou
