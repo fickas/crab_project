@@ -464,3 +464,15 @@ class MarshSegmentationDataset(Dataset):
         image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float()
         mask_tensor = torch.from_numpy(mask).long()
         return image_tensor, mask_tensor
+
+def get_augmentations(split, mean, std):
+    if split == 'train':
+        return A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.Normalize(mean=mean, std=std, max_pixel_value=1.0),
+        ])
+    return A.Compose([
+        A.Normalize(mean=mean, std=std, max_pixel_value=1.0),
+    ])
