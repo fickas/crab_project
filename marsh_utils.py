@@ -66,6 +66,7 @@ from rasterio.vrt import WarpedVRT
 from rasterio.enums import Resampling
 from contextlib import ExitStack
 
+from collections import Counter
 
 from torch.utils.data import Dataset
 
@@ -479,3 +480,32 @@ def get_augmentations(split, mean, std):
     return A.Compose([
         A.Normalize(mean=mean, std=std, max_pixel_value=1.0),
     ])
+
+def summarize_patches(patches, class_names=None, ignore_value=255):
+    """
+    Print patch counts and per-class pixel coverage per split.
+    class_names: dict {class_int: human_name}, or None.
+    """
+    splits = Counter(p['split'] for p in patches)
+    print(f"Total patches: {len(patches)}")
+    print(f"Splits: {dict(splits)}\n")
+
+    by_split = {'train': [], 'val': [], 'test': []}
+    for p in patches:
+        by_split[p['split']].append(p)
+
+    all_classes = sorted({int(c) for p in patches
+                          for c in np.unique(p['mask']) if c != ignore_value})
+
+    for split_name, split_patches in by_split.items():
+        if not split_patches:
+            continue
+        total_pixels = sum(p['mask'].size for p in split_patches)
+        print(f"--- {split_name}: {len(split_patches)} patches, {total_pixels:,} pixels")
+        for c in all_classes:
+            n = sum(int((p['mask'] == c).sum()) for p in split_patches)
+            label = class_names.get(c, '') if class_names else ''
+            print(f"  class {c:3d} {label:20s} {n:>12,} ({100*n/total_pixels:5.2f}%)")
+        n_ignore = sum(int((p['mask'] == ignore_value).sum()) for p in split_patches)
+        print(f"  ignore (255)           {n_ignore:>12,} ({100*n_ignore/total_pixels:5.2f}%)")
+        print()
