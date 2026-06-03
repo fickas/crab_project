@@ -60,6 +60,12 @@ from shapely.ops import unary_union
 from scipy import ndimage
 import segmentation_models_pytorch as smp
 
+from rasterio.windows import Window
+from rasterio.features import rasterize
+from rasterio.vrt import WarpedVRT
+from rasterio.enums import Resampling
+from contextlib import ExitStack
+
 #==============================================================
 
 def recommended_batch_size():
