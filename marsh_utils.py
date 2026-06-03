@@ -435,8 +435,6 @@ def build_patches_with_splits_multi(
                 'block_id': block,
             }
 
-
-
 class MarshSegmentationDataset(Dataset):
     """
     Holds a list of patch dicts and serves (image_tensor, mask_tensor) pairs.
@@ -465,6 +463,11 @@ class MarshSegmentationDataset(Dataset):
         mask_tensor = torch.from_numpy(mask).long()
         return image_tensor, mask_tensor
 
+'''
+Augmentation
+D4 symmetry plus color jitter for train, identity for val/test.
+ Albumentations handles image-and-mask jointly and uses nearest-neighbor for the mask by default, which preserves ignore_value=255 and class IDs through rotations.
+'''
 def get_augmentations(split, mean, std):
     if split == 'train':
         return A.Compose([
