@@ -168,6 +168,25 @@ def ensure_indices(
     print("NDRE:")
     compute_normalized_difference_raster(source_path, ndre_path, nir_band, re_band)
 
+def inspect_raster(path):
+    """Print basic info about a raster file."""
+    if not os.path.exists(path):
+        print(f"❌ Missing: {path}")
+        return None
+
+    with rasterio.open(path) as src:
+        print(f"\n=== {path} ===")
+        print(f"  Bounds: {src.bounds}")
+        print(f"  Size: {src.width} × {src.height} pixels")
+        print(f"  Resolution: {src.res[0]:.4f} × {src.res[1]:.4f}")
+        print(f"  CRS: {src.crs}")
+        print(f"  Bands: {src.count}")
+        print(f"  Dtype: {src.dtypes}")
+        print(f"  Nodata: {src.nodata}")
+        print(f"  Ground area: "
+              f"{(src.bounds.right - src.bounds.left):.1f}m × "
+              f"{(src.bounds.top - src.bounds.bottom):.1f}m")
+    return src.bounds
     paths[ndvi_key] = ndvi_path
     paths[ndre_key] = ndre_path
     return paths
