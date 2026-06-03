@@ -813,3 +813,351 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler,
             print(f"  → saved checkpoint  (val_mIoU={mean_iou:.4f})")
 
     return best_iou
+
+import torch
+import torch.nn.functional as F
+
+
+class PrecisionCoverageMetric:
+    """
+    Per-class precision, recall, and coverage at a list of confidence thresholds.
+
+    For each class c and threshold t:
+      - predicted[c, t]: pixels where argmax == c AND max-softmax >= t
+      - correct[c, t]  : predicted[c, t] AND target == c
+      - precision[c, t] = correct[c, t] / predicted[c, t]
+      - recall[c, t]    = correct[c, t] / total_actual[c]
+      - coverage[c, t]  = predicted[c, t] / total_valid_pixels
+
+    Ignores pixels where target == ignore_index in all denominators.
+    """
+    def __init__(self, num_classes, thresholds=None, ignore_index=255):
+        self.num_classes = num_classes
+        self.thresholds = (
+            [0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95]
+            if thresholds is None else list(thresholds)
+        )
+        self.ignore_index = ignore_index
+        self.reset()
+
+    def reset(self):
+        T = len(self.thresholds)
+        self.predicted   = torch.zeros(self.num_classes, T, dtype=torch.float64)
+        self.correct     = torch.zeros(self.num_classes, T, dtype=torch.float64)
+        self.actual      = torch.zeros(self.num_classes,    dtype=torch.float64)
+        self.total_valid = 0
+
+    @torch.no_grad()
+    def update(self, logits, targets):
+        # Probabilities and confident predictions
+        probs = F.softmax(logits.float(), dim=1)         # (B, C, H, W)
+        confidence, preds = probs.max(dim=1)             # (B, H, W) each
+        valid = (targets != self.ignore_index)           # (B, H, W)
+
+        # Filter to valid pixels to avoid wasted work and ignore-pollution
+        confidence_v = confidence[valid]                 # (N,)
+        preds_v      = preds[valid]                      # (N,)
+        targets_v    = targets[valid]                    # (N,)
+        self.total_valid += int(valid.sum().item())
+
+        # Per-class ground-truth pixel counts
+        for c in range(self.num_classes):
+            self.actual[c] += (targets_v == c).sum().double().cpu()
+
+        # Vectorize across thresholds: (N, T) boolean of "confidence >= t"
+        thresholds_t = torch.tensor(
+            self.thresholds, device=confidence_v.device, dtype=confidence_v.dtype
+        )
+        high_conf = confidence_v.unsqueeze(1) >= thresholds_t.unsqueeze(0)  # (N, T)
+
+        # For each class, count predicted and correct at every threshold
+        for c in range(self.num_classes):
+            pred_is_c = (preds_v == c).unsqueeze(1)              # (N, 1)
+            pred_c_high = pred_is_c & high_conf                  # (N, T)
+            self.predicted[c] += pred_c_high.sum(dim=0).double().cpu()
+
+            correct_mask = (targets_v == c).unsqueeze(1)         # (N, 1)
+            self.correct[c]   += (pred_c_high & correct_mask).sum(dim=0).double().cpu()
+
+    def compute(self):
+        # Precision: correct / predicted (per class, per threshold)
+        precision = self.correct / (self.predicted + 1e-7)
+        # Recall:    correct / actual_total_class (per class, per threshold)
+        recall    = self.correct / (self.actual.unsqueeze(1) + 1e-7)
+        # Coverage: predicted / total_valid (per class, per threshold)
+        coverage  = self.predicted / max(self.total_valid, 1)
+
+        return {
+            'thresholds':  list(self.thresholds),
+            'precision':   precision,   # (C, T)
+            'recall':      recall,      # (C, T)
+            'coverage':    coverage,    # (C, T)
+            'n_predicted': self.predicted,
+            'n_correct':   self.correct,
+            'n_actual':    self.actual,
+            'total_valid': self.total_valid,
+        }
+
+@torch.no_grad()
+def evaluate_precision_coverage(model, loader, num_classes,
+                                 thresholds=None, ignore_index=255, device='cuda'):
+    metric = PrecisionCoverageMetric(
+        num_classes=num_classes,
+        thresholds=thresholds,
+        ignore_index=ignore_index,
+    )
+    model.eval()
+    for images, masks in loader:
+        images = images.to(device, non_blocking=True)
+        masks  = masks.to(device,  non_blocking=True)
+        logits = model(images)
+        metric.update(logits, masks)
+    return metric.compute()
+
+import matplotlib.pyplot as plt
+
+
+def plot_precision_coverage(results, class_names=None, classes_of_interest=None):
+    """Two-panel plot: precision-vs-threshold and coverage-vs-threshold."""
+    thresholds = results['thresholds']
+    precision  = results['precision'].numpy()
+    coverage   = results['coverage'].numpy()
+
+    num_classes = precision.shape[0]
+    classes_of_interest = (
+        list(range(num_classes)) if classes_of_interest is None else classes_of_interest
+    )
+    names = class_names or {}
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for c in classes_of_interest:
+        label = names.get(c, f'class {c}')
+        axes[0].plot(thresholds, precision[c], marker='o', label=label)
+        axes[1].plot(thresholds, coverage[c],  marker='o', label=label)
+
+    axes[0].set_xlabel('Confidence threshold')
+    axes[0].set_ylabel('Precision')
+    axes[0].set_title('Per-class precision vs confidence threshold')
+    axes[0].set_ylim(0, 1.05)
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    axes[1].set_xlabel('Confidence threshold')
+    axes[1].set_ylabel('Coverage (fraction of all valid pixels)')
+    axes[1].set_title('Per-class coverage vs confidence threshold')
+    axes[1].set_yscale('log')   # coverage spans orders of magnitude
+    axes[1].grid(True, alpha=0.3, which='both')
+    axes[1].legend()
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_precision_vs_coverage(results, class_names=None, classes_of_interest=None):
+    """Tradeoff curve: precision (y) vs coverage (x), with thresholds annotated."""
+    thresholds = results['thresholds']
+    precision  = results['precision'].numpy()
+    coverage   = results['coverage'].numpy()
+
+    num_classes = precision.shape[0]
+    classes_of_interest = (
+        list(range(num_classes)) if classes_of_interest is None else classes_of_interest
+    )
+    names = class_names or {}
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for c in classes_of_interest:
+        label = names.get(c, f'class {c}')
+        ax.plot(coverage[c], precision[c], marker='o', label=label)
+        # Annotate threshold values at every other point to reduce clutter
+        for i in range(0, len(thresholds), 2):
+            ax.annotate(f'{thresholds[i]:.2f}',
+                        (coverage[c][i], precision[c][i]),
+                        fontsize=7, alpha=0.6,
+                        xytext=(4, 4), textcoords='offset points')
+
+    ax.set_xlabel('Coverage (fraction of valid pixels predicted as class)')
+    ax.set_ylabel('Precision')
+    ax.set_title('Precision-coverage tradeoff (confidence thresholds annotated)')
+    ax.set_xscale('log')
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3, which='both')
+    ax.legend()
+    plt.tight_layout()
+    return fig
+
+def print_precision_coverage_table(results, class_names=None, classes_of_interest=None):
+    thresholds = results['thresholds']
+    precision  = results['precision'].numpy()
+    recall     = results['recall'].numpy()
+    coverage   = results['coverage'].numpy()
+
+    num_classes = precision.shape[0]
+    classes_of_interest = (
+        list(range(num_classes)) if classes_of_interest is None else classes_of_interest
+    )
+    names = class_names or {}
+
+    for c in classes_of_interest:
+        label = names.get(c, f'class {c}')
+        print(f"\nClass {c} ({label}):")
+        print(f"  {'threshold':>9}  {'precision':>10}  {'recall':>10}  {'coverage':>10}")
+        for i, t in enumerate(thresholds):
+            print(f"  {t:>9.2f}  {precision[c][i]:>10.4f}  "
+                  f"{recall[c][i]:>10.4f}  {coverage[c][i]:>10.4f}")
+
+def pick_thresholds(pc_results, classes_of_interest, target_precision=0.9):
+    """
+    For each class, pick the lowest confidence threshold that achieves
+    at least target_precision on the validation set. Maximizes coverage
+    subject to a precision floor.
+
+    Returns dict mapping class -> chosen threshold.
+    """
+    thresholds = pc_results['thresholds']
+    precision  = pc_results['precision'].numpy()      # (C, T)
+    coverage   = pc_results['coverage'].numpy()       # (C, T)
+
+    chosen = {}
+    for cls in classes_of_interest:
+        valid = np.where(precision[cls] >= target_precision)[0]
+        if len(valid) > 0:
+            # Lowest threshold meeting the bar = highest coverage
+            i = valid[0]
+            chosen[cls] = float(thresholds[i])
+            print(f"  class {cls}: threshold={thresholds[i]:.2f}  "
+                  f"precision={precision[cls][i]:.3f}  "
+                  f"coverage={coverage[cls][i]:.3f}")
+        else:
+            # Target unattainable for this class — pick the highest threshold
+            # available and warn
+            i = -1
+            chosen[cls] = float(thresholds[i])
+            print(f"  class {cls}: WARNING no threshold reaches "
+                  f"precision={target_precision}, using {thresholds[i]:.2f} "
+                  f"(precision={precision[cls][i]:.3f})")
+    return chosen
+
+def config_to_dict(config_cls):
+    return {
+        k: v for k, v in vars(config_cls).items() if not k.startswith('_')
+    }
+
+def save_training_artifacts(output_dir, model, channel_means, channel_stds, training_summary):
+    os.makedirs(output_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(output_dir, 'model.pt'))
+
+    bundle = {
+        'config':         config_to_dict(Config),
+        'normalization': {
+            'mean': [float(x) for x in channel_means],
+            'std':  [float(x) for x in channel_stds],
+        },
+        'training_summary': training_summary,
+    }
+    with open(os.path.join(output_dir, 'config.json'), 'w') as f:
+        json.dump(bundle, f, indent=2)
+    print(f"Saved artifacts to {output_dir}")
+
+#Analyze channel importance
+@torch.no_grad()
+def channel_zero_ablation(model, loader, num_classes, classes_of_interest,
+                          channel_names=None, ignore_index=255, device='cuda'):
+    """
+    Inference-time channel ablation: zero out each channel one at a time
+    and measure mean IoU vs baseline.
+    Returns dict with baseline, per-channel mIoU, and per-channel drop.
+    """
+    model.eval()
+
+    def run_loader_with_mask(zero_channel=None):
+        m = IoUMetric(num_classes, ignore_index, classes_of_interest)
+        for images, masks in loader:
+            images = images.to(device, non_blocking=True).clone()
+            masks  = masks.to(device,  non_blocking=True)
+            if zero_channel is not None:
+                images[:, zero_channel] = 0
+            logits = model(images)
+            m.update(logits, masks)
+        return m.compute()
+
+    # Baseline (no ablation)
+    base_iou_per_class, base_mean_iou = run_loader_with_mask(None)
+
+    # Discover channel count from first batch
+    sample_imgs, _ = next(iter(loader))
+    n_channels = sample_imgs.shape[1]
+    names = channel_names or [f'ch{c}' for c in range(n_channels)]
+
+    results = {
+        'baseline_mean_iou':    base_mean_iou,
+        'baseline_iou_per_class': base_iou_per_class.tolist(),
+        'per_channel': {},
+    }
+
+    for ch in range(n_channels):
+        iou_per_class, mean_iou = run_loader_with_mask(ch)
+        results['per_channel'][names[ch]] = {
+            'mean_iou':        mean_iou,
+            'iou_per_class':   iou_per_class.tolist(),
+            'drop_from_base':  base_mean_iou - mean_iou,
+        }
+
+    return results
+
+
+@torch.no_grad()
+def channel_permutation_importance(model, loader, num_classes, classes_of_interest,
+                                    channel_names=None, ignore_index=255,
+                                    device='cuda', n_repeats=3):
+    """
+    Permute each channel's pixel values spatially within each sample,
+    measure mean IoU drop. Repeat n_repeats times for stability.
+    """
+    model.eval()
+
+    def baseline():
+        m = IoUMetric(num_classes, ignore_index, classes_of_interest)
+        for images, masks in loader:
+            images = images.to(device, non_blocking=True)
+            masks  = masks.to(device,  non_blocking=True)
+            logits = model(images)
+            m.update(logits, masks)
+        return m.compute()
+
+    base_iou_per_class, base_mean_iou = baseline()
+
+    sample_imgs, _ = next(iter(loader))
+    n_channels = sample_imgs.shape[1]
+    names = channel_names or [f'ch{c}' for c in range(n_channels)]
+
+    results = {
+        'baseline_mean_iou': base_mean_iou,
+        'per_channel': {},
+    }
+
+    for ch in range(n_channels):
+        drops = []
+        for _ in range(n_repeats):
+            m = IoUMetric(num_classes, ignore_index, classes_of_interest)
+            for images, masks in loader:
+                images = images.to(device, non_blocking=True).clone()
+                B, C, H, W = images.shape
+                # Permute pixels within each sample's channel
+                flat = images[:, ch].view(B, -1)
+                idx  = torch.stack([torch.randperm(H * W, device=device) for _ in range(B)])
+                permuted = flat.gather(1, idx).view(B, H, W)
+                images[:, ch] = permuted
+                masks = masks.to(device, non_blocking=True)
+                logits = model(images)
+                m.update(logits, masks)
+            _, mi = m.compute()
+            drops.append(base_mean_iou - mi)
+        results['per_channel'][names[ch]] = {
+            'drops':      drops,
+            'mean_drop':  sum(drops) / len(drops),
+            'std_drop':   (sum((d - sum(drops)/len(drops))**2 for d in drops) / len(drops)) ** 0.5,
+        }
+
+    return results
