@@ -221,3 +221,32 @@ def visualize_orthomosaic_sample(path, window_size_m=10):
         plt.title(f"{window_size_m}m × {window_size_m}m sample @ ({cx:.1f}, {cy:.1f})")
         plt.axis('off')
         plt.show()
+
+def get_block_id(x_world, y_world, block_size_m):
+    """Map world coordinates (in CRS units, assumed meters) to integer block IDs."""
+    return (int(x_world // block_size_m), int(y_world // block_size_m))
+
+
+def assign_blocks_to_splits(block_ids, train_frac=0.7, val_frac=0.15, seed=42):
+    """
+    Deterministically assign each unique block to train/val/test.
+    block_ids: iterable of (block_x, block_y) tuples.
+    Returns dict mapping (block_x, block_y) -> 'train' / 'val' / 'test'.
+    """
+    unique = sorted(set(block_ids))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique)
+
+    n = len(unique)
+    n_train = int(n * train_frac)
+    n_val = int(n * val_frac)
+
+    assignment = {}
+    for i, block in enumerate(unique):
+        if i < n_train:
+            assignment[block] = 'train'
+        elif i < n_train + n_val:
+            assignment[block] = 'val'
+        else:
+            assignment[block] = 'test'
+    return assignment
