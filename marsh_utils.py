@@ -70,6 +70,10 @@ from collections import Counter
 
 from torch.utils.data import Dataset
 
+
+import torch.nn as nn
+import torch.nn.functional as F
+
 #==============================================================
 
 def recommended_batch_size():
@@ -662,3 +666,43 @@ def compute_channel_stats(patches, output_path, skip_if_exists=True):
     print(f"  saved stats to {output_path}")
 
     return means, stds
+
+#  TRAINING ================================
+
+#Custom combined loss (CE + Dice, both ignore-aware).
+class CombinedLoss(nn.Module):
+    """
+    CE + Dice for multi-class semantic segmentation.
+    Pixels with target == ignore_index are excluded from both terms.
+    """
+    def __init__(self, num_classes, ignore_index=255,
+                 ce_weight=1.0, dice_weight=1.0, class_weights=None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.ignore_index = ignore_index
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.ce = nn.CrossEntropyLoss(weight=class_weights, ignore_index=ignore_index)
+
+    def _dice(self, logits, targets):
+        valid = (targets != self.ignore_index)               # (B, H, W)
+        probs = F.softmax(logits, dim=1)                     # (B, C, H, W)
+
+        # Replace ignore targets with 0 before one-hot, then mask
+        safe = targets.clone()
+        safe[~valid] = 0
+        onehot = F.one_hot(safe, num_classes=self.num_classes) \
+                  .permute(0, 3, 1, 2).float()               # (B, C, H, W)
+
+        mask = valid.unsqueeze(1).float()                    # (B, 1, H, W)
+        probs = probs * mask
+        onehot = onehot * mask
+
+        inter = (probs * onehot).sum(dim=(0, 2, 3))
+        denom = probs.sum(dim=(0, 2, 3)) + onehot.sum(dim=(0, 2, 3))
+        dice = (2.0 * inter + 1e-7) / (denom + 1e-7)
+        return 1.0 - dice.mean()
+
+    def forward(self, logits, targets):
+        return self.ce_weight * self.ce(logits, targets) \
+             + self.dice_weight * self._dice(logits, targets)
