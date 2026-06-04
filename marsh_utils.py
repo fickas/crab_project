@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import , GradScaler
+from torch.cuda.amp import  GradScaler
 
 # ── Segmentation + augmentation ──
 import segmentation_models_pytorch as smp
