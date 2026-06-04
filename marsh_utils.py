@@ -1156,7 +1156,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
 def validate(model, loader, criterion, metric, device):
     # Derive autocast parameters from the inputs
     device_type = device.type if hasattr(device, 'type') else str(device).split(':')[0]
-    amp_enabled = scaler is not None
+    amp_enabled = device_type == 'cuda'
   
     model.eval()
     total_loss, n_batches = 0.0, 0
