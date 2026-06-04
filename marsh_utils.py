@@ -627,6 +627,10 @@ class IoUMetric:
 
 #Training and validation step functions (this is where AMP lands)
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
+    # Derive autocast parameters from the inputs
+    device_type = device.type if hasattr(device, 'type') else str(device).split(':')[0]
+    amp_enabled = scaler is not None
+  
     model.train()
     total_loss, n_batches = 0.0, 0
     for images, masks in loader:
