@@ -666,7 +666,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler,
           num_epochs, num_classes, ignore_index=255,
           ckpt_path=None,
           device='cuda', class_names=None):
-    scaler = GradScaler(device='cuda')
+    scaler = GradScaler()
     metric = IoUMetric(num_classes=6, classes_of_interest=[3, 4, 5])
     best_iou = 0.0
 
