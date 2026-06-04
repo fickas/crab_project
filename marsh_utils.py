@@ -1,88 +1,51 @@
-# Standard scientific Python
+# ── Standard library ──
+import os
+import json
+import math
+from pathlib import Path
+from datetime import datetime
+from types import SimpleNamespace
+from contextlib import ExitStack
+from collections import Counter
+
+# ── Scientific Python ──
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from pathlib import Path
-import os
-import json
-import datetime
+from scipy import ndimage
+from sklearn.metrics import confusion_matrix, classification_report
 
-# Geospatial
+# ── Geospatial: rasterio ──
 import rasterio
 from rasterio.mask import mask
-from rasterio.features import rasterize
+from rasterio.features import rasterize, shapes
 from rasterio.enums import Resampling
+from rasterio.transform import from_origin
+from rasterio.windows import Window
+from rasterio.vrt import WarpedVRT
+
+# ── Geospatial: shapely + geopandas ──
 import geopandas as gpd
-from shapely.geometry import box, mapping, Polygon
+from shapely.geometry import (LineString, Point, Polygon, MultiPolygon,
+                              box, mapping, shape)
+from shapely.ops import unary_union
 from shapely import wkt
 
-# Image processing
+# ── Image processing ──
 import cv2
 from PIL import Image
 
-# Deep learning
+# ── Deep learning ──
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
-# Segmentation library
-# May need to install: !pip install segmentation-models-pytorch
-import segmentation_models_pytorch as smp
-
-# Augmentation
-# May need to install: !pip install albumentations
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-
-# Metrics
-from sklearn.metrics import confusion_matrix, classification_report
-
-import os, json, math
-from datetime import datetime
-from types import SimpleNamespace
-
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-import rasterio
-from rasterio.transform import from_origin
-from rasterio.features import rasterize, shapes
-from rasterio.windows import Window
-from rasterio.vrt import WarpedVRT
-
-import geopandas as gpd
-from shapely.geometry import Polygon, box, mapping
-from shapely.ops import unary_union
-
-from scipy import ndimage
-import segmentation_models_pytorch as smp
-
-from rasterio.windows import Window
-from rasterio.features import rasterize
-from rasterio.vrt import WarpedVRT
-from rasterio.enums import Resampling
-from contextlib import ExitStack
-
-from collections import Counter
-
-from torch.utils.data import Dataset
-
-
-import torch.nn as nn
-import torch.nn.functional as F
-
 from torch.cuda.amp import autocast, GradScaler
 
-from shapely.geometry import shape
-from scipy import ndimage
-
-from rasterio.transform import from_origin
-from rasterio.features import rasterize
-from shapely.geometry import LineString, Polygon, Point, box, MultiPolygon
-from shapely.ops import unary_union
+# ── Segmentation + augmentation ──
+import segmentation_models_pytorch as smp
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 #==============================================================
 
