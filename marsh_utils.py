@@ -76,6 +76,9 @@ import torch.nn.functional as F
 
 from torch.cuda.amp import autocast, GradScaler
 
+from shapely.geometry import shape
+from scipy import ndimage
+
 #==============================================================
 
 def recommended_batch_size():
@@ -1358,3 +1361,106 @@ def predict_full_raster(
 
         print(f"Wrote predictions: {output_path}")
         print(f"  shape: {probs_final.shape}  classes: {list(cfg.CLASS_NAMES.values())}")
+
+def predictions_to_polygons(
+    prob_raster_path,
+    cfg,
+    classes=None,
+    min_area_m2=1.0,
+    morph_close_pixels=3,
+    morph_open_pixels=2,
+):
+    """
+    Extract polygons from a multi-band probability raster.
+
+    For each class of interest:
+      1. Identify pixels where argmax == class AND max_prob >= threshold[class]
+      2. Apply morphological closing (fill small gaps) and opening (drop noise)
+      3. Run connected components → one region per contiguous blob
+      4. Vectorize to polygons, attach mean confidence and area
+      5. Drop polygons below min_area_m2
+
+    Returns:
+        GeoDataFrame with columns:
+            class, class_name, threshold, mean_confidence, area_m2, geometry
+    """
+    if classes is None:
+        classes = cfg.CLASSES_OF_INTEREST
+
+    thresholds = cfg.CONFIDENCE_THRESHOLDS or {}
+
+    with rasterio.open(prob_raster_path) as src:
+        crs       = src.crs
+        transform = src.transform
+        probs     = src.read()                      # (C, H, W)
+
+    argmax   = probs.argmax(axis=0).astype(np.int32)   # (H, W) best class per pixel
+    max_prob = probs.max(axis=0)                       # (H, W) max softmax per pixel
+
+    all_features = []
+
+    for cls in classes:
+        threshold = thresholds.get(cls, 0.5)
+
+        mask = (argmax == cls) & (max_prob >= threshold)
+
+        if not mask.any():
+            print(f"  class {cls} ({cfg.CLASS_NAMES[cls]}): "
+                  f"no pixels above threshold {threshold}")
+            continue
+
+        # Morphology cleanup
+        if morph_close_pixels > 0:
+            mask = ndimage.binary_closing(mask, iterations=morph_close_pixels)
+        if morph_open_pixels > 0:
+            mask = ndimage.binary_opening(mask, iterations=morph_open_pixels)
+
+        if not mask.any():
+            print(f"  class {cls} ({cfg.CLASS_NAMES[cls]}): "
+                  f"no pixels remain after morphology")
+            continue
+
+        # Connected components — each region gets a unique label
+        labeled, n_components = ndimage.label(mask)
+
+        # Mean confidence per labeled region (vectorized over all labels at once)
+        mean_confs = ndimage.mean(
+            max_prob, labels=labeled, index=range(1, n_components + 1)
+        )
+
+        # Vectorize: rasterio.features.shapes returns one polygon per labeled region
+        labeled_i32 = labeled.astype(np.int32)
+        for geom, label_id in shapes(labeled_i32, mask=mask, transform=transform):
+            label_id = int(label_id)
+            if label_id == 0:
+                continue
+
+            geom_obj = shape(geom)
+            area_m2 = geom_obj.area     # projected CRS → meters²
+
+            if area_m2 < min_area_m2:
+                continue
+
+            all_features.append({
+                'class':           cls,
+                'class_name':      cfg.CLASS_NAMES[cls],
+                'threshold':       threshold,
+                'mean_confidence': float(mean_confs[label_id - 1]),
+                'area_m2':         float(area_m2),
+                'geometry':        geom_obj,
+            })
+
+    if not all_features:
+        return gpd.GeoDataFrame(
+            columns=['class', 'class_name', 'threshold',
+                     'mean_confidence', 'area_m2'],
+            geometry=[], crs=crs,
+        )
+
+    gdf = gpd.GeoDataFrame(all_features, crs=crs)
+    gdf = gdf.sort_values(['class', 'area_m2'], ascending=[True, False]).reset_index(drop=True)
+
+    print(f"\nExtracted {len(gdf)} polygons:")
+    print(gdf.groupby('class_name')['area_m2'].agg(['count', 'sum', 'mean']).round(2))
+
+    return gdf
