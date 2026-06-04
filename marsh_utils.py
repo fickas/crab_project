@@ -2357,16 +2357,27 @@ def downsample_block_mean(arr, factor):
     return arr_crop.reshape(n, h2, factor, w2, factor).mean(axis=(2, 4))
 
 
-def write_dem(path, bounds, dem_gsd_m=0.5, smoothing_sigma_m=2.0):
-    """Synthetic DEM: gradient from upland (high) toward channel (low).
-    Written at dem_gsd_m resolution (default 50cm), not the imagery GSD.
-    """
+def write_dem(path, bounds, dem_gsd_m=0.01, smoothing_sigma_m=0.3, geom=None):
+    """Synthetic DEM at imagery resolution. Optional channel-cutting via geom."""
     xmin, ymin, xmax, ymax = bounds.bounds
     width  = int(round((xmax - xmin) / dem_gsd_m))
     height = int(round((ymax - ymin) / dem_gsd_m))
     transform = from_origin(xmin, ymax, dem_gsd_m, dem_gsd_m)
+
+    # Base gradient: upland (right) high → channel side (left) low
     x_grad = np.linspace(0.5, 2.5, width)
     dem = np.tile(x_grad, (height, 1)).astype(np.float32)
+
+    # Cut channels into the DEM if geometry was passed (makes slope/TPI meaningful)
+    if geom is not None and 'all_water' in geom and not geom['all_water'].is_empty:
+        from rasterio.features import rasterize
+        water_mask = rasterize(
+            [(geom['all_water'], 1)],
+            out_shape=(height, width), transform=transform,
+            fill=0, default_value=1, dtype='uint8',
+        ).astype(np.float32)
+        dem -= 0.4 * water_mask    # channels sit ~40 cm below marsh platform
+
     dem += np.random.default_rng(123).normal(0, 0.05, dem.shape).astype(np.float32)
     sigma_px = max(1.0, smoothing_sigma_m / dem_gsd_m)
     dem = ndimage.gaussian_filter(dem, sigma=sigma_px)
@@ -2429,5 +2440,7 @@ def generate_dataset(output_dir, bounds, geom, polygons_gdf, dataset_name,
         with rasterio.open(os.path.join(output_dir, 'ms_5band.tif'), 'r+') as ds:
             ds.descriptions = ('Blue', 'Green', 'Red', 'RedEdge', 'NIR')
 
-    print(f"  Writing dem_5m.tif (50cm GSD)...")
-    write_dem(os.path.join(output_dir, 'dem_5m.tif'), bounds, dem_gsd_m=0.5)
+    imagery_gsd = min(g for g in (pan_gsd_m, ms_gsd_m) if g is not None)
+    print(f"  Writing dem_5m.tif at imagery GSD ({imagery_gsd*100:.1f}cm)...")
+    write_dem(os.path.join(output_dir, 'dem_5m.tif'),
+              bounds, dem_gsd_m=imagery_gsd, geom=geom)
