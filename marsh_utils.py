@@ -1202,3 +1202,159 @@ def channel_permutation_importance_per_class(
         'band_names':   bnames,
         'class_names':  cnames,
     }
+
+#  PRODUCTION ==========================
+
+def _gaussian_weight(patch_size, sigma_ratio=0.3):
+    """Gaussian falloff centered on the patch — suppresses edge artifacts."""
+    coords = np.linspace(-1, 1, patch_size)
+    x, y = np.meshgrid(coords, coords)
+    return np.exp(-(x ** 2 + y ** 2) / (2 * sigma_ratio ** 2)).astype(np.float32)
+
+
+def _patch_positions(h, w, patch_size, stride):
+    """Sliding-window positions ensuring the right/bottom edges are covered."""
+    rows = list(range(0, h - patch_size + 1, stride))
+    if rows and rows[-1] != h - patch_size:
+        rows.append(h - patch_size)
+    cols = list(range(0, w - patch_size + 1, stride))
+    if cols and cols[-1] != w - patch_size:
+        cols.append(w - patch_size)
+    return [(r, c) for r in rows for c in cols]
+
+def predict_full_raster(
+    model,
+    cfg,
+    paths,
+    channel_means,
+    channel_stds,
+    output_path,
+    device='cuda',
+    use_amp=True,
+):
+    """
+    Sliding-window inference over the full reference raster.
+
+    Writes a multi-band GeoTIFF with one band per class, each containing the
+    per-pixel softmax probability for that class. Overlapping patch predictions
+    are blended with a Gaussian weighting centered on each patch.
+
+    Patch size, overlap, batch size, band spec, normalization stats, class
+    names, and N_CLASSES all come from cfg. The reference raster (and output
+    grid) is the first raster in cfg.BAND_SPEC. Other rasters are aligned via
+    WarpedVRT if their grids differ.
+    """
+    band_spec = [tuple(item) for item in cfg.BAND_SPEC]
+    mean = np.asarray(channel_means, dtype=np.float32)
+    std  = np.asarray(channel_stds,  dtype=np.float32)
+
+    stride = max(1, int(cfg.PATCH_SIZE * (1 - cfg.OVERLAP)))
+    weight = _gaussian_weight(cfg.PATCH_SIZE)
+
+    # Resolve unique source raster paths in band_spec order
+    raster_paths_ordered = []
+    for key, _ in band_spec:
+        p = paths[key]
+        if p not in raster_paths_ordered:
+            raster_paths_ordered.append(p)
+    band_spec_resolved = [(paths[key], idx) for key, idx in band_spec]
+
+    with ExitStack() as stack:
+        # Reference raster defines the output grid
+        ref_src = stack.enter_context(rasterio.open(raster_paths_ordered[0]))
+        sources = {raster_paths_ordered[0]: ref_src}
+
+        # Open and align other rasters
+        for p in raster_paths_ordered[1:]:
+            src = stack.enter_context(rasterio.open(p))
+            if _grids_match(src, ref_src):
+                sources[p] = src
+            else:
+                sources[p] = stack.enter_context(WarpedVRT(
+                    src, crs=ref_src.crs, transform=ref_src.transform,
+                    width=ref_src.width, height=ref_src.height,
+                    resampling=Resampling.bilinear,
+                ))
+
+        # Group bands by raster for efficient reads
+        bands_by_path = {}
+        for path, band_idx in band_spec_resolved:
+            bands_by_path.setdefault(path, []).append(band_idx)
+
+        h, w = ref_src.height, ref_src.width
+        positions = _patch_positions(h, w, cfg.PATCH_SIZE, stride)
+        print(f"Inference grid: {h}×{w}, {len(positions)} patches "
+              f"({cfg.PATCH_SIZE}×{cfg.PATCH_SIZE}, stride {stride})")
+
+        # In-memory accumulators
+        probs_acc   = np.zeros((cfg.N_CLASSES, h, w), dtype=np.float32)
+        weights_acc = np.zeros((h, w),                dtype=np.float32)
+
+        model.eval()
+        for batch_start in range(0, len(positions), cfg.BATCH_SIZE):
+            batch_positions = positions[batch_start: batch_start + cfg.BATCH_SIZE]
+
+            # Read and normalize each patch in the batch
+            batch_images = []
+            for row, col in batch_positions:
+                window = Window(col, row, cfg.PATCH_SIZE, cfg.PATCH_SIZE)
+                arrays_by_key = {}
+                for path, band_indices in bands_by_path.items():
+                    src = sources[path]
+                    arr = src.read(band_indices, window=window)
+                    for i, b in enumerate(band_indices):
+                        arrays_by_key[(path, b)] = arr[i]
+
+                image = np.stack(
+                    [arrays_by_key[(p, b)] for p, b in band_spec_resolved],
+                    axis=0,
+                ).astype(np.float32)
+
+                # Replace NaN from NDVI/NDRE with 0 before normalization
+                image = np.nan_to_num(image, nan=0.0)
+                image = (image - mean[:, None, None]) / std[:, None, None]
+                batch_images.append(image)
+
+            batch = torch.from_numpy(np.stack(batch_images)).to(device, non_blocking=True)
+
+            with torch.no_grad():
+                device_type = next(model.parameters()).device.type        # 'cuda' or 'cpu'
+                amp_enabled = use_amp and device_type == 'cuda'
+                with torch.amp.autocast(device_type, enabled=amp_enabled):
+                    logits = model(batch)
+                    probs  = torch.softmax(logits, dim=1)
+            probs_np = probs.float().cpu().numpy()      # (B, C, H, W)
+
+            # Gaussian-weighted accumulation
+            for i, (row, col) in enumerate(batch_positions):
+                probs_acc[:, row:row + cfg.PATCH_SIZE, col:col + cfg.PATCH_SIZE] \
+                    += probs_np[i] * weight
+                weights_acc[row:row + cfg.PATCH_SIZE, col:col + cfg.PATCH_SIZE] \
+                    += weight
+
+            if (batch_start // cfg.BATCH_SIZE) % 50 == 0:
+                done = min(batch_start + cfg.BATCH_SIZE, len(positions))
+                print(f"  {done}/{len(positions)} patches")
+
+        # Normalize accumulated probs by accumulated weights
+        weights_safe = np.maximum(weights_acc, 1e-8)
+        probs_final  = probs_acc / weights_safe[None]
+
+        # Write multi-band GeoTIFF — one band per class
+        profile = ref_src.profile.copy()
+        profile.update(
+            count=cfg.N_CLASSES,
+            dtype='float32',
+            compress='lzw',
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            nodata=None,
+        )
+        with rasterio.open(output_path, 'w', **profile) as dst:
+            for c in range(cfg.N_CLASSES):
+                dst.write(probs_final[c].astype(np.float32), c + 1)
+                dst.set_band_description(c + 1, cfg.CLASS_NAMES.get(c, f'class_{c}'))
+
+        print(f"Wrote predictions: {output_path}")
+        print(f"  shape: {probs_final.shape}  classes: {list(cfg.CLASS_NAMES.values())}")
