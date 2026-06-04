@@ -1990,6 +1990,8 @@ def branching_tributary(parent_line, parent_t, length, angle_deg,
 def generate_marsh_geometry(bounds, rng):
     """Generate channels, banks, trees, hummock, and ponds."""
     xmin, ymin, xmax, ymax = bounds.bounds
+    cx = (xmin + xmax) / 2     # ← add these two lines
+    cy = (ymin + ymax) / 2
 
     main = sinuous_line(
         start=(xmin + 25, ymax - 3),
@@ -2042,7 +2044,7 @@ def generate_marsh_geometry(bounds, rng):
     right_trees = Polygon(right_pts).buffer(0)
     all_trees = unary_union([bottom_trees, right_trees]).intersection(bounds).difference(all_water)
 
-    hum_center = (CX + 30, CY + 15)
+    hum_center = (cx + 30, cy + 15)
     hum_pts = []
     for theta in np.linspace(0, 2*np.pi, 30):
         r = 10 + rng.uniform(-3, 3)
