@@ -51,15 +51,30 @@ from albumentations.pytorch import ToTensorV2
 # make_class_index_raster, composite_spectra, and the synth-data main())
 CRS = "EPSG:26919"
 SEED = 42
-# Class scheme — QGIS-style 1-indexed (model uses 0-indexed via QGIS_TO_MODEL)
-CLASSES = {
-    'other':              1,
-    'healthy_bank':       2,
-    'eroding_non_crab':   3,
-    'crab_edge':          4,
-    'crab_platform':      5,
-    'collapsed':          6,
+# ── Class scheme (single source of truth — don't redefine in notebooks) ──
+CLASS_NAMES = {
+    0: 'other',
+    1: 'healthy_bank',
+    2: 'eroding_non_crab',
+    3: 'crab_edge',
+    4: 'crab_platform',
+    5: 'collapsed',
 }
+# Derived: name → QGIS-style 1-indexed (for shapefile writes / synthetic gen)
+CLASSES = {name: idx + 1 for idx, name in CLASS_NAMES.items()}
+# Derived: QGIS-style 1-indexed → model 0-indexed
+QGIS_TO_MODEL = {q: m for m, q in zip(CLASS_NAMES.keys(), CLASSES.values())}
+MODEL_TO_QGIS = {m: q for q, m in QGIS_TO_MODEL.items()}
+
+# Bank classes you want exported as polygons (model-0-indexed)
+CRAB_CLASSES = ['crab_edge', 'crab_platform', 'collapsed']
+CLASSES_OF_INTEREST = [m for m, name in CLASS_NAMES.items() if name in CRAB_CLASSES]
+
+# Rasterization priority — higher class index wins overlaps
+PRIORITY = [5, 4, 3, 2, 1, 0]
+
+IGNORE_INDEX = 255
+
 # Per-class spectral signatures used by the synthetic data generator.
 # Order: Blue (475nm), Green (560nm), Red (668nm), RedEdge (717nm), NIR (842nm).
 # Values are reflectance in [0, 1], chosen to make NDVI/NDRE differentiable
