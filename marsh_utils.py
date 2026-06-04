@@ -157,7 +157,511 @@ def ensure_indices(
 
     paths[ndvi_key] = ndvi_path     # ← add these
     paths[ndre_key] = ndre_path     # ←
-    return paths   
+    return paths
+
+#++++++  MORE BAND DERIVATIONS
+
+"""
+Additions to marsh_utils.py — derived raster bands beyond NDVI/NDRE.
+
+Copy whatever you decide to use into marsh_utils.py. Each compute_* function
+does the math + raster I/O; each ensure_* function is the cache-and-update-paths
+wrapper following the existing ensure_indices pattern.
+
+Conventions:
+  - Outputs are float32, with NaN as nodata.
+  - DEFLATE + predictor=3 compression for floats (better than LZW for non-int data).
+  - Inputs read with NaN-aware logic (existing nodata gets converted to NaN on read).
+  - All ensure_* functions are idempotent: skip recompute if output exists,
+    and update `paths` dict in place.
+
+Default band order assumes RedEdge-P: B=1, G=2, R=3, RE=4, NIR=5.
+"""
+import os
+import numpy as np
+import rasterio
+from rasterio.transform import Affine
+from scipy import ndimage
+
+
+# ============================================================================
+# Low-level I/O helpers
+# ============================================================================
+def _read_band_as_float(src, band_idx):
+    """Read a band as float32, converting nodata to NaN."""
+    arr = src.read(band_idx).astype(np.float32)
+    nd = src.nodatavals[band_idx - 1] if src.nodatavals else None
+    if nd is not None and not np.isnan(nd):
+        arr[arr == nd] = np.nan
+    return arr
+
+
+def _write_derived_raster(out_path, data, ref_src, dtype='float32'):
+    """Write a single-band derived raster with the same georeferencing as ref_src."""
+    profile = ref_src.profile.copy()
+    profile.update(
+        count=1, dtype=dtype,
+        nodata=float('nan') if dtype.startswith('float') else None,
+        compress='DEFLATE',
+        predictor=3 if dtype.startswith('float') else 2,
+        tiled=True, blockxsize=256, blockysize=256,
+    )
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(data.astype(dtype), 1)
+
+
+def _gsd_meters(src):
+    """Pixel size in meters from a rasterio source (assumes square pixels in a projected CRS)."""
+    return abs(src.transform.a)
+
+
+# ============================================================================
+# Spectral indices (computed from a multispectral source)
+# ============================================================================
+def compute_savi_raster(src_path, out_path, red_band=3, nir_band=5, L=0.5):
+    """SAVI = (NIR - R) / (NIR + R + L) * (1 + L)
+    Soil-adjusted vegetation index. Less biased by bare soil than NDVI;
+    useful for mixed pixels at damaged banks. L=0.5 is the canonical mid-cover
+    value (use 0.25 for dense, 1.0 for sparse cover)."""
+    if os.path.exists(out_path):
+        print(f"  SAVI already exists at {out_path}, skipping")
+        return
+    with rasterio.open(src_path) as src:
+        red = _read_band_as_float(src, red_band)
+        nir = _read_band_as_float(src, nir_band)
+        savi = (nir - red) / (nir + red + L) * (1.0 + L)
+        _write_derived_raster(out_path, savi, src)
+    print(f"  wrote SAVI to {out_path}")
+
+
+def compute_evi_raster(src_path, out_path, blue_band=1, red_band=3, nir_band=5,
+                       G=2.5, C1=6.0, C2=7.5, L=1.0):
+    """EVI = G * (NIR - R) / (NIR + C1*R - C2*B + L)
+    Enhanced vegetation index. Resists atmospheric and soil effects better
+    than NDVI; particularly useful in mixed-substrate marsh edges."""
+    if os.path.exists(out_path):
+        print(f"  EVI already exists at {out_path}, skipping")
+        return
+    with rasterio.open(src_path) as src:
+        blue = _read_band_as_float(src, blue_band)
+        red  = _read_band_as_float(src, red_band)
+        nir  = _read_band_as_float(src, nir_band)
+        denom = nir + C1 * red - C2 * blue + L
+        evi = G * (nir - red) / denom
+        # EVI can blow up for very dark pixels; clip extremes
+        evi = np.where(np.abs(denom) < 1e-4, np.nan, evi)
+        evi = np.clip(evi, -2.0, 2.0)
+        _write_derived_raster(out_path, evi, src)
+    print(f"  wrote EVI to {out_path}")
+
+
+def compute_ci_rededge_raster(src_path, out_path, re_band=4, nir_band=5):
+    """CIred-edge = NIR / RE - 1
+    Chlorophyll Index using red-edge. Not a normalized-difference form, so
+    less redundant with NDVI than NDRE. Sensitive to chlorophyll content."""
+    if os.path.exists(out_path):
+        print(f"  CIred-edge already exists at {out_path}, skipping")
+        return
+    with rasterio.open(src_path) as src:
+        re_ = _read_band_as_float(src, re_band)
+        nir = _read_band_as_float(src, nir_band)
+        ci = np.where(re_ > 1e-4, nir / re_ - 1.0, np.nan)
+        _write_derived_raster(out_path, ci, src)
+    print(f"  wrote CIred-edge to {out_path}")
+
+
+# GNDVI and NDWI are just normalized-difference indices.
+# Reuse your existing compute_normalized_difference_raster(src, out, num, den).
+# Convenience wrappers:
+def compute_gndvi_raster(src_path, out_path, green_band=2, nir_band=5):
+    """GNDVI = (NIR - G) / (NIR + G). Chlorophyll index using green instead of red."""
+    from marsh_utils import compute_normalized_difference_raster
+    if os.path.exists(out_path):
+        print(f"  GNDVI already exists at {out_path}, skipping"); return
+    compute_normalized_difference_raster(src_path, out_path, nir_band, green_band)
+
+
+def compute_ndwi_raster(src_path, out_path, green_band=2, nir_band=5):
+    """NDWI (McFeeters) = (G - NIR) / (G + NIR). Highlights water and saturated mud."""
+    from marsh_utils import compute_normalized_difference_raster
+    if os.path.exists(out_path):
+        print(f"  NDWI already exists at {out_path}, skipping"); return
+    compute_normalized_difference_raster(src_path, out_path, green_band, nir_band)
+
+
+# ============================================================================
+# DEM-derived bands
+# ============================================================================
+def compute_slope_raster(dem_path, out_path, units='degrees'):
+    """Slope from DEM using Horn's 3x3 method.
+    units: 'degrees' (0..90) or 'radians' or 'percent'."""
+    if os.path.exists(out_path):
+        print(f"  Slope already exists at {out_path}, skipping"); return
+    with rasterio.open(dem_path) as src:
+        dem = _read_band_as_float(src, 1)
+        cell = _gsd_meters(src)
+        # Horn's method (Sobel-style kernels normalized for slope)
+        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32) / (8.0 * cell)
+        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32) / (8.0 * cell)
+        # Fill NaNs with edge values for the convolution, mask result afterwards
+        nan_mask = np.isnan(dem)
+        dem_filled = np.where(nan_mask, np.nanmean(dem), dem)
+        dx = ndimage.convolve(dem_filled, kx, mode='nearest')
+        dy = ndimage.convolve(dem_filled, ky, mode='nearest')
+        slope_rad = np.arctan(np.sqrt(dx * dx + dy * dy))
+        if units == 'degrees':
+            slope = np.degrees(slope_rad)
+        elif units == 'radians':
+            slope = slope_rad
+        elif units == 'percent':
+            slope = np.tan(slope_rad) * 100.0
+        else:
+            raise ValueError(f"units must be degrees|radians|percent, got {units}")
+        slope[nan_mask] = np.nan
+        _write_derived_raster(out_path, slope, src)
+    print(f"  wrote slope ({units}) to {out_path}")
+
+
+def compute_tpi_raster(dem_path, out_path, neighborhood_m=2.0):
+    """Topographic Position Index: dem - mean(dem in neighborhood).
+    Positive = relative ridge/hummock; negative = relative depression.
+    Picks up 'this bank is slumped relative to surrounding marsh' directly."""
+    if os.path.exists(out_path):
+        print(f"  TPI already exists at {out_path}, skipping"); return
+    with rasterio.open(dem_path) as src:
+        dem = _read_band_as_float(src, 1)
+        cell = _gsd_meters(src)
+        window_px = max(3, int(round(neighborhood_m / cell)))
+        if window_px % 2 == 0:
+            window_px += 1   # odd window centers cleanly
+        # Mean of valid pixels in window (ignoring NaN)
+        # Use uniform_filter with NaN handling: filter ones and values separately
+        valid = (~np.isnan(dem)).astype(np.float32)
+        dem_zeroed = np.where(np.isnan(dem), 0.0, dem)
+        sum_f = ndimage.uniform_filter(dem_zeroed, size=window_px, mode='nearest')
+        cnt_f = ndimage.uniform_filter(valid,      size=window_px, mode='nearest')
+        mean_dem = np.where(cnt_f > 0, sum_f / cnt_f, np.nan)
+        tpi = dem - mean_dem
+        _write_derived_raster(out_path, tpi, src)
+    print(f"  wrote TPI ({neighborhood_m}m window) to {out_path}")
+
+
+def compute_curvature_raster(dem_path, out_path):
+    """Curvature via Laplacian of elevation.
+    Positive = concave (depression-like), negative = convex (ridge-like).
+    Simpler than full Zevenbergen-Thorne profile/plan curvature."""
+    if os.path.exists(out_path):
+        print(f"  Curvature already exists at {out_path}, skipping"); return
+    with rasterio.open(dem_path) as src:
+        dem = _read_band_as_float(src, 1)
+        cell = _gsd_meters(src)
+        kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32) / (cell * cell)
+        nan_mask = np.isnan(dem)
+        dem_filled = np.where(nan_mask, np.nanmean(dem), dem)
+        curv = ndimage.convolve(dem_filled, kernel, mode='nearest')
+        curv[nan_mask] = np.nan
+        _write_derived_raster(out_path, curv, src)
+    print(f"  wrote curvature to {out_path}")
+
+
+def compute_hillshade_raster(dem_path, out_path, azimuth_deg=315.0, altitude_deg=45.0):
+    """Hillshade (synthetic illumination from DEM). Output 0..255.
+    Often visually useful for QGIS inspection; less obviously useful as a model
+    input since slope+aspect carry the same info, but cheap to include."""
+    if os.path.exists(out_path):
+        print(f"  Hillshade already exists at {out_path}, skipping"); return
+    with rasterio.open(dem_path) as src:
+        dem = _read_band_as_float(src, 1)
+        cell = _gsd_meters(src)
+        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32) / (8.0 * cell)
+        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32) / (8.0 * cell)
+        nan_mask = np.isnan(dem)
+        dem_filled = np.where(nan_mask, np.nanmean(dem), dem)
+        dx = ndimage.convolve(dem_filled, kx, mode='nearest')
+        dy = ndimage.convolve(dem_filled, ky, mode='nearest')
+        slope = np.arctan(np.sqrt(dx * dx + dy * dy))
+        aspect = np.arctan2(dy, -dx)
+        az_rad = np.deg2rad(360.0 - azimuth_deg + 90.0)
+        alt_rad = np.deg2rad(altitude_deg)
+        hs = (np.cos(alt_rad) * np.cos(slope) +
+              np.sin(alt_rad) * np.sin(slope) * np.cos(az_rad - aspect))
+        hs = np.clip(hs * 255.0, 0, 255).astype(np.uint8)
+        hs[nan_mask] = 0
+        # Write as uint8 (not float32) since it's just a visualization layer
+        profile = src.profile.copy()
+        profile.update(count=1, dtype='uint8', nodata=0,
+                       compress='LZW', predictor=2, tiled=True,
+                       blockxsize=256, blockysize=256)
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            dst.write(hs, 1)
+    print(f"  wrote hillshade to {out_path}")
+
+
+# ============================================================================
+# Channel-dependent bands (require a binary channel mask raster)
+# ============================================================================
+def ensure_channel_mask_from_ndwi(paths, ndwi_key='ndwi', threshold=0.0,
+                                  out_key='channel_mask',
+                                  morph_close_m=0.5, min_area_m2=10.0):
+    """Build a binary channel mask from NDWI thresholding + cleanup.
+
+    Pixels with NDWI > threshold are 'water'. Apply morphological closing to
+    bridge thin gaps, then remove connected components smaller than min_area_m2.
+
+    Idempotent: skip if mask file exists. Updates paths dict in place.
+    """
+    src_path = paths[ndwi_key]
+    src_dir = os.path.dirname(src_path)
+    out_path = paths.get(out_key) or os.path.join(src_dir, 'channel_mask.tif')
+
+    if os.path.exists(out_path):
+        print(f"  channel mask already exists at {out_path}, skipping")
+        paths[out_key] = out_path
+        return paths
+
+    with rasterio.open(src_path) as src:
+        ndwi = _read_band_as_float(src, 1)
+        cell = _gsd_meters(src)
+        mask = (ndwi > threshold) & ~np.isnan(ndwi)
+        # Morphological closing to bridge narrow channel breaks
+        close_px = max(1, int(round(morph_close_m / cell)))
+        mask = ndimage.binary_closing(mask, iterations=close_px)
+        # Remove small connected components
+        labeled, n = ndimage.label(mask)
+        if n > 0:
+            sizes = ndimage.sum(mask, labeled, range(1, n + 1))
+            min_pix = int(min_area_m2 / (cell * cell))
+            too_small = np.where(sizes < min_pix)[0] + 1
+            for lid in too_small:
+                mask[labeled == lid] = False
+        # Write as uint8
+        profile = src.profile.copy()
+        profile.update(count=1, dtype='uint8', nodata=255,
+                       compress='LZW', predictor=2, tiled=True,
+                       blockxsize=256, blockysize=256)
+        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+        with rasterio.open(out_path, 'w', **profile) as dst:
+            dst.write(mask.astype(np.uint8), 1)
+    paths[out_key] = out_path
+    print(f"  wrote channel mask to {out_path}")
+    return paths
+
+
+def compute_distance_to_channel_raster(channel_mask_path, out_path):
+    """Euclidean distance (in meters) from each pixel to nearest channel pixel."""
+    if os.path.exists(out_path):
+        print(f"  distance-to-channel already exists at {out_path}, skipping"); return
+    with rasterio.open(channel_mask_path) as src:
+        mask = src.read(1).astype(bool)
+        cell = _gsd_meters(src)
+        # distance_transform_edt: distance to nearest zero pixel
+        # We want distance to nearest channel (mask==True), so invert
+        dist_px = ndimage.distance_transform_edt(~mask)
+        dist_m = dist_px.astype(np.float32) * cell
+        _write_derived_raster(out_path, dist_m, src)
+    print(f"  wrote distance-to-channel to {out_path}")
+
+
+def compute_relative_elevation_raster(dem_path, channel_mask_path, out_path):
+    """Height of each pixel above the nearest channel pixel.
+
+    Both rasters must be on the same grid (same shape, transform). If they
+    aren't, resample one to the other before calling this. Most useful when
+    DEM and channel_mask are both at imagery GSD or at the DEM's native GSD.
+    """
+    if os.path.exists(out_path):
+        print(f"  relative elevation already exists at {out_path}, skipping"); return
+    with rasterio.open(dem_path) as dem_src, rasterio.open(channel_mask_path) as ch_src:
+        if dem_src.shape != ch_src.shape or dem_src.transform != ch_src.transform:
+            raise ValueError(
+                f"DEM ({dem_src.shape} @ {dem_src.transform}) and channel mask "
+                f"({ch_src.shape} @ {ch_src.transform}) must be on identical grids"
+            )
+        dem = _read_band_as_float(dem_src, 1)
+        mask = ch_src.read(1).astype(bool)
+        # For each pixel, find indices of nearest channel pixel
+        _, indices = ndimage.distance_transform_edt(~mask, return_indices=True)
+        nearest_channel_dem = dem[tuple(indices)]
+        rel_elev = dem - nearest_channel_dem
+        _write_derived_raster(out_path, rel_elev, dem_src)
+    print(f"  wrote relative elevation to {out_path}")
+
+
+# ============================================================================
+# Texture / structure bands (from pan or any single-band raster)
+# ============================================================================
+def compute_local_std_raster(src_path, out_path, band=1, window_m=0.3):
+    """Local standard deviation in a window (texture).
+    Distinguishes mud / wrack / bare from short Spartina even when mean
+    reflectance is similar. window_m is the window edge length in meters."""
+    if os.path.exists(out_path):
+        print(f"  local std already exists at {out_path}, skipping"); return
+    with rasterio.open(src_path) as src:
+        img = _read_band_as_float(src, band)
+        cell = _gsd_meters(src)
+        win = max(3, int(round(window_m / cell)))
+        if win % 2 == 0:
+            win += 1
+        nan_mask = np.isnan(img)
+        img_filled = np.where(nan_mask, np.nanmean(img), img)
+        mean_f  = ndimage.uniform_filter(img_filled,           size=win, mode='nearest')
+        sqmean  = ndimage.uniform_filter(img_filled * img_filled, size=win, mode='nearest')
+        var = np.maximum(sqmean - mean_f * mean_f, 0.0)
+        std = np.sqrt(var)
+        std[nan_mask] = np.nan
+        _write_derived_raster(out_path, std, src)
+    print(f"  wrote local std ({window_m}m window) to {out_path}")
+
+
+def compute_laplacian_raster(src_path, out_path, band=1):
+    """Laplacian (second derivative) of a single band — picks up edges and
+    fine-scale texture in the pan band."""
+    if os.path.exists(out_path):
+        print(f"  Laplacian already exists at {out_path}, skipping"); return
+    with rasterio.open(src_path) as src:
+        img = _read_band_as_float(src, band)
+        nan_mask = np.isnan(img)
+        img_filled = np.where(nan_mask, np.nanmean(img), img)
+        lap = ndimage.laplace(img_filled)
+        lap[nan_mask] = np.nan
+        _write_derived_raster(out_path, lap, src)
+    print(f"  wrote Laplacian to {out_path}")
+
+
+# ============================================================================
+# ensure_* wrappers — follow the existing ensure_indices pattern
+# ============================================================================
+def _ensure_one(paths, source_key, out_key, default_filename, compute_fn, **kwargs):
+    """Generic ensure-and-update helper."""
+    source_path = paths[source_key]
+    src_dir = os.path.dirname(source_path)
+    out_path = paths.get(out_key) or os.path.join(src_dir, default_filename)
+    compute_fn(source_path, out_path, **kwargs)
+    paths[out_key] = out_path
+    return paths
+
+
+def ensure_savi(paths, ms_key='pansharp_ms', red_band=3, nir_band=5, L=0.5,
+                out_key='savi'):
+    return _ensure_one(paths, ms_key, out_key, 'savi.tif',
+                       compute_savi_raster, red_band=red_band, nir_band=nir_band, L=L)
+
+
+def ensure_evi(paths, ms_key='pansharp_ms', blue_band=1, red_band=3, nir_band=5,
+               out_key='evi'):
+    return _ensure_one(paths, ms_key, out_key, 'evi.tif',
+                       compute_evi_raster, blue_band=blue_band, red_band=red_band,
+                       nir_band=nir_band)
+
+
+def ensure_gndvi(paths, ms_key='pansharp_ms', green_band=2, nir_band=5, out_key='gndvi'):
+    return _ensure_one(paths, ms_key, out_key, 'gndvi.tif',
+                       compute_gndvi_raster, green_band=green_band, nir_band=nir_band)
+
+
+def ensure_ndwi(paths, ms_key='pansharp_ms', green_band=2, nir_band=5, out_key='ndwi'):
+    return _ensure_one(paths, ms_key, out_key, 'ndwi.tif',
+                       compute_ndwi_raster, green_band=green_band, nir_band=nir_band)
+
+
+def ensure_ci_rededge(paths, ms_key='pansharp_ms', re_band=4, nir_band=5,
+                      out_key='ci_rededge'):
+    return _ensure_one(paths, ms_key, out_key, 'ci_rededge.tif',
+                       compute_ci_rededge_raster, re_band=re_band, nir_band=nir_band)
+
+
+def ensure_slope(paths, dem_key='dem_high_res', units='degrees', out_key='slope'):
+    return _ensure_one(paths, dem_key, out_key, 'slope.tif',
+                       compute_slope_raster, units=units)
+
+
+def ensure_tpi(paths, dem_key='dem_high_res', neighborhood_m=2.0, out_key='tpi'):
+    return _ensure_one(paths, dem_key, out_key, 'tpi.tif',
+                       compute_tpi_raster, neighborhood_m=neighborhood_m)
+
+
+def ensure_curvature(paths, dem_key='dem_high_res', out_key='curvature'):
+    return _ensure_one(paths, dem_key, out_key, 'curvature.tif',
+                       compute_curvature_raster)
+
+
+def ensure_hillshade(paths, dem_key='dem_high_res',
+                     azimuth_deg=315.0, altitude_deg=45.0, out_key='hillshade'):
+    return _ensure_one(paths, dem_key, out_key, 'hillshade.tif',
+                       compute_hillshade_raster,
+                       azimuth_deg=azimuth_deg, altitude_deg=altitude_deg)
+
+
+def ensure_distance_to_channel(paths, channel_mask_key='channel_mask',
+                               out_key='dist_to_channel'):
+    return _ensure_one(paths, channel_mask_key, out_key, 'dist_to_channel.tif',
+                       compute_distance_to_channel_raster)
+
+
+def ensure_relative_elevation(paths, dem_key='dem_high_res',
+                              channel_mask_key='channel_mask',
+                              out_key='rel_elevation'):
+    """Special-cased because it needs two source rasters."""
+    dem_path = paths[dem_key]
+    ch_path = paths[channel_mask_key]
+    out_path = paths.get(out_key) or os.path.join(
+        os.path.dirname(dem_path), 'rel_elevation.tif')
+    compute_relative_elevation_raster(dem_path, ch_path, out_path)
+    paths[out_key] = out_path
+    return paths
+
+
+def ensure_local_std(paths, src_key='pan_orthomosaic', band=1, window_m=0.3,
+                    out_key='local_std'):
+    return _ensure_one(paths, src_key, out_key, 'local_std.tif',
+                       compute_local_std_raster, band=band, window_m=window_m)
+
+
+def ensure_laplacian(paths, src_key='pan_orthomosaic', band=1, out_key='laplacian'):
+    return _ensure_one(paths, src_key, out_key, 'laplacian.tif',
+                       compute_laplacian_raster, band=band)
+
+
+# ============================================================================
+# Aggregate convenience
+# ============================================================================
+def ensure_optional_bands(paths, which=('slope', 'savi', 'ndwi'), **kwargs):
+    """Run a set of ensure_* functions in one call.
+
+    Pass which=('slope', 'savi', 'ndwi', 'dist_to_channel', ...) — any subset of:
+        savi, evi, gndvi, ndwi, ci_rededge,
+        slope, tpi, curvature, hillshade,
+        channel_mask, dist_to_channel, rel_elevation,
+        local_std, laplacian
+
+    Order matters for derived-from-derived: 'channel_mask' should come before
+    'dist_to_channel' / 'rel_elevation' (it's their input).
+
+    Returns paths (updated in place).
+    """
+    registry = {
+        'savi':            ensure_savi,
+        'evi':             ensure_evi,
+        'gndvi':           ensure_gndvi,
+        'ndwi':            ensure_ndwi,
+        'ci_rededge':      ensure_ci_rededge,
+        'slope':           ensure_slope,
+        'tpi':             ensure_tpi,
+        'curvature':       ensure_curvature,
+        'hillshade':       ensure_hillshade,
+        'channel_mask':    ensure_channel_mask_from_ndwi,
+        'dist_to_channel': ensure_distance_to_channel,
+        'rel_elevation':   ensure_relative_elevation,
+        'local_std':       ensure_local_std,
+        'laplacian':       ensure_laplacian,
+    }
+    for name in which:
+        if name not in registry:
+            raise ValueError(f"Unknown band {name!r}. Valid: {list(registry)}")
+        registry[name](paths, **kwargs.get(name, {}))
+    return paths
 
 def inspect_raster(path):
     """Print basic info about a raster file."""
