@@ -79,6 +79,11 @@ from torch.cuda.amp import autocast, GradScaler
 from shapely.geometry import shape
 from scipy import ndimage
 
+from rasterio.transform import from_origin
+from rasterio.features import rasterize
+from shapely.geometry import LineString, Polygon, Point, box, MultiPolygon
+from shapely.ops import unary_union
+
 #==============================================================
 
 def recommended_batch_size():
@@ -1464,3 +1469,490 @@ def predictions_to_polygons(
     print(gdf.groupby('class_name')['area_m2'].agg(['count', 'sum', 'mean']).round(2))
 
     return gdf
+
+#  SYNTHETIC DATA GENERATION ===========================
+
+# ============================================================================
+# Geometry generators
+# ============================================================================
+def sinuous_line(start, end, n_points=100, amplitude=8.0, n_waves=2.5,
+                 noise_amp=2.0, rng=None):
+    """Generate a sinuous LineString between two points."""
+    if rng is None: rng = np.random.default_rng()
+    t = np.linspace(0, 1, n_points)
+    xs = np.interp(t, [0, 1], [start[0], end[0]])
+    ys = np.interp(t, [0, 1], [start[1], end[1]])
+    dx, dy = end[0]-start[0], end[1]-start[1]
+    L = np.hypot(dx, dy)
+    px, py = -dy/L, dx/L
+    phase = rng.uniform(0, 2*np.pi)
+    sine = amplitude * np.sin(t * n_waves * 2 * np.pi + phase) * np.sin(t * np.pi)
+    noise = rng.normal(0, noise_amp, n_points)
+    noise = np.convolve(noise, np.ones(7)/7, mode='same')
+    perturb = sine + noise
+    return LineString(list(zip(xs + perturb * px, ys + perturb * py)))
+
+
+def branching_tributary(parent_line, parent_t, length, angle_deg,
+                       amplitude=4.0, n_waves=1.5, rng=None):
+    """Branch off a parent line at parameterized position parent_t."""
+    if rng is None: rng = np.random.default_rng()
+    coords = list(parent_line.coords)
+    idx = max(1, min(len(coords)-2, int(parent_t * (len(coords) - 1))))
+    tx = coords[idx+1][0] - coords[idx-1][0]
+    ty = coords[idx+1][1] - coords[idx-1][1]
+    tlen = np.hypot(tx, ty)
+    tx, ty = tx/tlen, ty/tlen
+    a = np.deg2rad(angle_deg)
+    bx = tx*np.cos(a) - ty*np.sin(a)
+    by = tx*np.sin(a) + ty*np.cos(a)
+    start = (coords[idx][0], coords[idx][1])
+    end = (start[0] + bx*length, start[1] + by*length)
+    return sinuous_line(start, end, n_points=60, amplitude=amplitude,
+                        n_waves=n_waves, noise_amp=1.0, rng=rng)
+
+
+def generate_marsh_geometry(bounds, rng):
+    """Generate channels, banks, trees, hummock, and ponds."""
+    xmin, ymin, xmax, ymax = bounds.bounds
+
+    main = sinuous_line(
+        start=(xmin + 25, ymax - 3),
+        end=(xmin + 35, ymin + 3),
+        n_points=140, amplitude=10.0, n_waves=3.0, noise_amp=2.0, rng=rng,
+    )
+
+    tribs = []
+    for parent_t, angle, length in [
+        (0.18, 70,  60),
+        (0.32, 85,  75),
+        (0.48, 95,  85),
+        (0.62, 80,  78),
+        (0.78, 75,  65),
+    ]:
+        tribs.append(branching_tributary(main, parent_t, length, angle, rng=rng))
+
+    sub_tribs = []
+    for trib in tribs:
+        if rng.random() > 0.3:
+            for _ in range(rng.integers(1, 3)):
+                t_branch = rng.uniform(0.3, 0.8)
+                angle    = rng.choice([-60, -45, 45, 60]) + rng.normal(0, 10)
+                length   = rng.uniform(15, 35)
+                sub_tribs.append(branching_tributary(
+                    trib, t_branch, length, angle,
+                    amplitude=1.5, n_waves=1.2, rng=rng,
+                ))
+
+    main_water = main.buffer(4.0, cap_style=2)
+    trib_waters = [t.buffer(1.0, cap_style=2) for t in tribs]
+    sub_waters  = [s.buffer(0.5, cap_style=2) for s in sub_tribs]
+    all_water   = unary_union([main_water] + trib_waters + sub_waters).intersection(bounds)
+
+    main_bank  = main_water.buffer(2.5).difference(main_water)
+    trib_bank  = unary_union([w.buffer(1.0).difference(w) for w in trib_waters])
+    sub_bank   = unary_union([w.buffer(0.4).difference(w) for w in sub_waters])
+    all_banks  = unary_union([main_bank, trib_bank, sub_bank]).intersection(bounds).difference(all_water)
+
+    bottom_pts = [(xmin, ymin)]
+    for x in np.linspace(xmin, xmax, 30):
+        bottom_pts.append((x, ymin + 12 + rng.uniform(-4, 12)))
+    bottom_pts.append((xmax, ymin))
+    bottom_trees = Polygon(bottom_pts).buffer(0)
+
+    right_pts = [(xmax, ymax)]
+    for y in np.linspace(ymax, ymin + 30, 25):
+        right_pts.append((xmax + rng.uniform(-12, -2), y))
+    right_pts.append((xmax, ymin + 30))
+    right_trees = Polygon(right_pts).buffer(0)
+    all_trees = unary_union([bottom_trees, right_trees]).intersection(bounds).difference(all_water)
+
+    hum_center = (CX + 30, CY + 15)
+    hum_pts = []
+    for theta in np.linspace(0, 2*np.pi, 30):
+        r = 10 + rng.uniform(-3, 3)
+        hum_pts.append((hum_center[0] + r*np.cos(theta), hum_center[1] + r*np.sin(theta)))
+    hummock = Polygon(hum_pts).buffer(0).intersection(bounds).difference(all_water)
+
+    ponds = []
+    for _ in range(3):
+        cx = rng.uniform(xmin + 40, xmax - 20)
+        cy = rng.uniform(ymin + 35, ymax - 20)
+        r  = rng.uniform(1.5, 3.0)
+        p_pts = []
+        for theta in np.linspace(0, 2*np.pi, 16):
+            rr = r + rng.uniform(-0.3, 0.3)
+            p_pts.append((cx + rr*np.cos(theta), cy + rr*np.sin(theta)))
+        ponds.append(Polygon(p_pts))
+    all_ponds = unary_union(ponds).intersection(bounds).difference(all_water).difference(all_banks)
+
+    return dict(
+        main_channel=main,
+        tributaries=tribs + sub_tribs,
+        all_water=all_water, all_banks=all_banks,
+        all_trees=all_trees, hummock=hummock, all_ponds=all_ponds,
+    )
+
+
+# ============================================================================
+# Polygon label assignment
+# ============================================================================
+def split_channel_buffer_segments(channel_line, water_buf, bank_buf, n_segments, rng):
+    """Divide a channel's bank zone into N segments along its length."""
+    L = channel_line.length
+    if L < 5.0:
+        return []
+    segments = []
+    for i in range(n_segments):
+        t0, t1 = i/n_segments, (i+1)/n_segments
+        t0e = max(0, t0 - 0.01); t1e = min(1, t1 + 0.01)
+        n_pts = max(4, int(L * (t1e - t0e) / 0.5))
+        ts = np.linspace(t0e, t1e, n_pts)
+        coords = [channel_line.interpolate(t, normalized=True).coords[0] for t in ts]
+        sub_line = LineString(coords)
+        seg = sub_line.buffer(bank_buf, cap_style=2).difference(sub_line.buffer(water_buf, cap_style=2))
+        if seg.area > 0.1:
+            segments.append(seg)
+    return segments
+
+
+def assign_bank_class_per_segment(n_segments, character, rng):
+    """Probabilistically assign a bank class to each segment based on channel character."""
+    weights_by_char = {
+        'healthy': {'healthy_bank': 0.70, 'eroding_non_crab': 0.20, 'crab_edge': 0.07,
+                    'crab_platform': 0.02, 'collapsed': 0.01},
+        'eroding': {'healthy_bank': 0.20, 'eroding_non_crab': 0.55, 'crab_edge': 0.15,
+                    'crab_platform': 0.05, 'collapsed': 0.05},
+        'crab':    {'healthy_bank': 0.05, 'eroding_non_crab': 0.10, 'crab_edge': 0.35,
+                    'crab_platform': 0.30, 'collapsed': 0.20},
+        'mixed':   {'healthy_bank': 0.35, 'eroding_non_crab': 0.20, 'crab_edge': 0.20,
+                    'crab_platform': 0.15, 'collapsed': 0.10},
+    }
+    weights = weights_by_char[character]
+    classes = list(weights.keys())
+    probs   = np.array(list(weights.values()))
+    probs   = probs / probs.sum()
+    return rng.choice(classes, size=n_segments, p=probs).tolist()
+
+
+def assign_polygon_labels(geom, rng):
+    """Generate a labeled polygon GeoDataFrame from the marsh geometry."""
+    rows = []
+    all_water = geom['all_water']
+
+    def clean(seg):
+        """Trim a segment polygon so it doesn't overlap channel water."""
+        if seg.is_empty:
+            return seg
+        return seg.difference(all_water)
+
+    main_segs = split_channel_buffer_segments(geom['main_channel'], 4.0, 6.5, 15, rng)
+    main_classes = assign_bank_class_per_segment(len(main_segs), 'healthy', rng)
+    for seg, c in zip(main_segs, main_classes):
+        cleaned = clean(seg)
+        if cleaned.area > 0.05:
+            rows.append({'Class': CLASSES[c], 'geometry': cleaned})
+
+    characters = ['healthy', 'mixed', 'crab', 'eroding', 'mixed', 'crab', 'healthy',
+                  'mixed', 'eroding', 'crab']
+    for i, trib in enumerate(geom['tributaries']):
+        if trib.length < 8:
+            n_seg = 3
+        elif trib.length < 30:
+            n_seg = 5
+        else:
+            n_seg = 8
+        char = characters[i % len(characters)]
+        # Use generous buffer so polygons cover the full bank zone, then trim water
+        segs = split_channel_buffer_segments(trib, 0.4, 1.6, n_seg, rng)
+        if not segs:
+            continue
+        seg_classes = assign_bank_class_per_segment(len(segs), char, rng)
+        for seg, c in zip(segs, seg_classes):
+            cleaned = clean(seg)
+            if cleaned.area > 0.05:
+                rows.append({'Class': CLASSES[c], 'geometry': cleaned})
+
+    other_polys = []
+    if not geom['all_trees'].is_empty:
+        if isinstance(geom['all_trees'], MultiPolygon):
+            other_polys.extend([p for p in geom['all_trees'].geoms if p.area > 1.0])
+        else:
+            other_polys.append(geom['all_trees'])
+    if not geom['hummock'].is_empty:
+        other_polys.append(geom['hummock'])
+    if not geom['all_ponds'].is_empty:
+        if isinstance(geom['all_ponds'], MultiPolygon):
+            other_polys.extend([p for p in geom['all_ponds'].geoms if p.area > 0.5])
+        else:
+            other_polys.append(geom['all_ponds'])
+    for p in other_polys:
+        rows.append({'Class': CLASSES['other'], 'geometry': p})
+
+    gdf = gpd.GeoDataFrame(rows, geometry='geometry', crs=CRS)
+    gdf = gdf[gdf.area > 0.05].reset_index(drop=True)
+    return gdf
+
+
+def ensure_all_classes_in_m1(polygons_m1, m1_bounds, geom, rng):
+    """Make sure all 6 classes appear in M1 polygons.
+
+    For missing bank classes (2-6): relabel the largest existing bank polygons
+    (geometry stays natural — ring along channel — and spectral burn uses the
+    new class).  For missing 'other' (1) or if not enough banks to relabel,
+    add a small synthetic polygon in marsh interior.
+    """
+    if len(polygons_m1) == 0:
+        present = set()
+    else:
+        present = set(int(c) for c in polygons_m1['Class'].tolist())
+    missing = sorted({1, 2, 3, 4, 5, 6} - present)
+    if not missing:
+        return polygons_m1
+
+    print(f"  M1 missing classes {missing} — relabeling/adding to cover all 6")
+
+    # Relabel existing bank polygons for any missing bank classes
+    bank_missing = [c for c in missing if c != 1]
+    bank_polys   = polygons_m1[polygons_m1['Class'].isin([2, 3, 4, 5, 6])]
+    sorted_idx   = bank_polys.geometry.area.sort_values(ascending=False).index.tolist()
+    relabeled    = 0
+    for cls, idx in zip(bank_missing, sorted_idx):
+        polygons_m1.at[idx, 'Class'] = cls
+        relabeled += 1
+
+    # Anything still missing (no banks to relabel, or class 1) → add new polygons
+    still_missing = bank_missing[relabeled:] + ([1] if 1 in missing else [])
+    new_rows = []
+    xmin, ymin, xmax, ymax = m1_bounds.bounds
+    for cls in still_missing:
+        for _ in range(40):
+            cx = rng.uniform(xmin + 2, xmax - 2)
+            cy = rng.uniform(ymin + 2, ymax - 2)
+            r  = rng.uniform(0.5, 1.0)
+            pts = [(cx + r*np.cos(t), cy + r*np.sin(t)) for t in np.linspace(0, 2*np.pi, 12)]
+            poly = Polygon(pts)
+            if poly.intersects(geom['all_water']):
+                continue
+            if polygons_m1.intersects(poly).any():
+                continue
+            new_rows.append({'Class': cls, 'geometry': poly})
+            break
+
+    if new_rows:
+        new_gdf = gpd.GeoDataFrame(new_rows, crs=polygons_m1.crs)
+        polygons_m1 = gpd.GeoDataFrame(
+            pd.concat([polygons_m1, new_gdf], ignore_index=True),
+            crs=polygons_m1.crs,
+        )
+    return polygons_m1
+
+
+# ============================================================================
+# Raster rendering
+# ============================================================================
+def make_class_index_raster(geom, polygons_gdf, bounds, resolution_m):
+    """Create a uint8 raster with spectral class indices for every pixel."""
+    xmin, ymin, xmax, ymax = bounds.bounds
+    width  = int(round((xmax - xmin) / resolution_m))
+    height = int(round((ymax - ymin) / resolution_m))
+    transform = from_origin(xmin, ymax, resolution_m, resolution_m)
+    print(f"  Raster: {width}×{height} pixels at {resolution_m*100:.1f}cm GSD "
+          f"({width*height/1e6:.1f}M pixels)")
+
+    idx_raster = np.full((height, width), SPECTRAL_IDX['marsh_platform'], dtype=np.uint8)
+
+    def burn(shape, value):
+        if shape is None or shape.is_empty:
+            return
+        rasterize([(shape, value)], out=idx_raster, transform=transform,
+                  fill=0, default_value=value, all_touched=False)
+
+    # Trees, hummock, ponds
+    if not geom['all_trees'].is_empty:
+        burn(geom['all_trees'], SPECTRAL_IDX['tree'])
+    if not geom['hummock'].is_empty:
+        burn(geom['hummock'], SPECTRAL_IDX['tree'])
+    if not geom['all_ponds'].is_empty:
+        burn(geom['all_ponds'], SPECTRAL_IDX['water'])
+
+    # Bank polygons (matches their labels)
+    class_to_spectral = {
+        CLASSES['healthy_bank']:     SPECTRAL_IDX['healthy_bank'],
+        CLASSES['eroding_non_crab']: SPECTRAL_IDX['eroding_non_crab'],
+        CLASSES['crab_edge']:        SPECTRAL_IDX['crab_edge'],
+        CLASSES['crab_platform']:    SPECTRAL_IDX['crab_platform'],
+        CLASSES['collapsed']:        SPECTRAL_IDX['collapsed'],
+    }
+    bank_polys = polygons_gdf[polygons_gdf['Class'].isin(class_to_spectral.keys())]
+    if len(bank_polys) > 0:
+        shapes = [(row.geometry, class_to_spectral[row['Class']])
+                  for _, row in bank_polys.iterrows()]
+        rasterize(shapes, out=idx_raster, transform=transform,
+                  fill=0, default_value=0, all_touched=False)
+
+    # Water (highest priority - overlays everything)
+    if not geom['all_water'].is_empty:
+        rasterize([(geom['all_water'], SPECTRAL_IDX['water'])],
+                  out=idx_raster, transform=transform,
+                  fill=0, default_value=SPECTRAL_IDX['water'], all_touched=False)
+
+    return idx_raster, transform
+
+
+def composite_spectra(idx_raster, rng):
+    """Convert class index raster into a 5-band reflectance raster (float32)."""
+    height, width = idx_raster.shape
+    ms = np.zeros((5, height, width), dtype=np.float32)
+    for idx_value, spectrum in IDX_TO_SPECTRA.items():
+        mask = (idx_raster == idx_value)
+        if not mask.any():
+            continue
+        for band in range(5):
+            ms[band][mask] = spectrum[band]
+
+    for band in range(5):
+        # Low-frequency texture
+        noise_lf = rng.normal(0, 1.0, (height // 16 + 2, width // 16 + 2))
+        noise_lf = ndimage.zoom(noise_lf, 16, order=1)[:height, :width]
+        noise_lf = ndimage.gaussian_filter(noise_lf, sigma=8)
+        noise_lf *= 0.015
+        # Per-pixel noise
+        noise_hf = rng.normal(0, 0.008, (height, width))
+        ms[band] += noise_lf.astype(np.float32) + noise_hf.astype(np.float32)
+
+    np.clip(ms, 0.0, 1.0, out=ms)
+    return ms
+
+
+def make_pan(ms, rng):
+    """Synthesize a broadband panchromatic band as a weighted MS sum."""
+    weights = np.array([0.20, 0.30, 0.30, 0.10, 0.10])
+    pan = (weights[:, None, None] * ms).sum(axis=0)
+    pan += rng.normal(0, 0.005, pan.shape).astype(np.float32)
+    np.clip(pan, 0.0, 1.0, out=pan)
+    return pan
+
+
+def compute_index(num, den):
+    """Normalized difference index with denominator safety."""
+    out = np.full_like(num, np.nan, dtype=np.float32)
+    denom = num + den
+    valid = denom > 0.005
+    out[valid] = (num[valid] - den[valid]) / denom[valid]
+    return out
+
+
+def write_geotiff(path, data, transform, dtype, count=None, nodata=None):
+    """Write a tiled, compressed GeoTIFF.
+    LZW + horizontal predictor for integers; DEFLATE + floating predictor for floats.
+    """
+    if data.ndim == 2:
+        data = data[np.newaxis]
+    count = count or data.shape[0]
+    profile = {
+        'driver': 'GTiff', 'height': data.shape[1], 'width': data.shape[2],
+        'count': count, 'dtype': dtype, 'crs': CRS, 'transform': transform,
+        'tiled': True, 'blockxsize': 256, 'blockysize': 256,
+    }
+    if dtype.startswith('uint') or dtype.startswith('int'):
+        profile.update(compress='LZW', predictor=2)
+    else:
+        profile.update(compress='DEFLATE', predictor=3, zlevel=6)
+    if nodata is not None:
+        profile['nodata'] = nodata
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with rasterio.open(path, 'w', **profile) as dst:
+        if dtype.startswith('uint'):
+            scaled = np.clip(data * 10000.0, 1, np.iinfo(dtype).max).astype(dtype)
+            dst.write(scaled)
+        else:
+            dst.write(data.astype(dtype))
+
+
+def downsample_block_mean(arr, factor):
+    """Average over factor×factor blocks. Handles 2D and 3D arrays."""
+    h, w = arr.shape[-2:]
+    h2, w2 = h // factor, w // factor
+    if arr.ndim == 2:
+        arr_crop = arr[:h2*factor, :w2*factor]
+        return arr_crop.reshape(h2, factor, w2, factor).mean(axis=(1, 3))
+    arr_crop = arr[..., :h2*factor, :w2*factor]
+    n = arr_crop.shape[0]
+    return arr_crop.reshape(n, h2, factor, w2, factor).mean(axis=(2, 4))
+
+
+def write_dem(path, bounds, dem_gsd_m=0.5, smoothing_sigma_m=2.0):
+    """Synthetic DEM: gradient from upland (high) toward channel (low).
+    Written at dem_gsd_m resolution (default 50cm), not the imagery GSD.
+    """
+    xmin, ymin, xmax, ymax = bounds.bounds
+    width  = int(round((xmax - xmin) / dem_gsd_m))
+    height = int(round((ymax - ymin) / dem_gsd_m))
+    transform = from_origin(xmin, ymax, dem_gsd_m, dem_gsd_m)
+    x_grad = np.linspace(0.5, 2.5, width)
+    dem = np.tile(x_grad, (height, 1)).astype(np.float32)
+    dem += np.random.default_rng(123).normal(0, 0.05, dem.shape).astype(np.float32)
+    sigma_px = max(1.0, smoothing_sigma_m / dem_gsd_m)
+    dem = ndimage.gaussian_filter(dem, sigma=sigma_px)
+    write_geotiff(path, dem, transform, dtype='float32')
+
+
+# ============================================================================
+# End-to-end pipeline
+# ============================================================================
+def generate_dataset(output_dir, bounds, geom, polygons_gdf, dataset_name,
+                     pan_gsd_m=None, ms_gsd_m=None, seed_offset=0):
+    """Generate raw raster outputs (no derived indices — ensure_indices() does that).
+
+    Writes (depending on which GSDs are provided):
+      ms_5band.tif       at ms_gsd_m  (raw multispectral, B/G/R/RE/NIR stacked)
+      pan.tif            at pan_gsd_m (single-band panchromatic)
+      pansharp_5band.tif at pan_gsd_m (pansharpened multispectral)
+      dem_5m.tif         at 0.5m GSD  (synthetic gradient DEM)
+    """
+    rng = np.random.default_rng(SEED + seed_offset)
+    print(f"\nGenerating dataset: {dataset_name}")
+    print(f"  Output dir: {output_dir}")
+    os.makedirs(output_dir, exist_ok=True)
+
+    gsds = [g for g in (pan_gsd_m, ms_gsd_m) if g is not None]
+    if not gsds:
+        raise ValueError("Must specify pan_gsd_m or ms_gsd_m")
+    fine_gsd = min(gsds)
+
+    idx_raster, transform = make_class_index_raster(geom, polygons_gdf, bounds, fine_gsd)
+
+    print(f"  Compositing spectral bands at {fine_gsd*100:.1f}cm GSD...")
+    ms_fine = composite_spectra(idx_raster, rng)
+
+    # Pan + pansharp at finest GSD
+    if pan_gsd_m is not None and abs(pan_gsd_m - fine_gsd) < 1e-9:
+        pan = make_pan(ms_fine, rng)
+        print(f"  Writing pan.tif ({pan_gsd_m*100:.1f}cm)...")
+        write_geotiff(os.path.join(output_dir, 'pan.tif'),
+                      pan, transform, dtype='uint16')
+        print(f"  Writing pansharp_5band.tif ({pan_gsd_m*100:.1f}cm)...")
+        write_geotiff(os.path.join(output_dir, 'pansharp_5band.tif'),
+                      ms_fine, transform, dtype='uint16', count=5)
+        with rasterio.open(os.path.join(output_dir, 'pansharp_5band.tif'), 'r+') as ds:
+            ds.descriptions = ('Blue', 'Green', 'Red', 'RedEdge', 'NIR')
+
+    # MS at ms_gsd_m (possibly coarser — block-mean downsample)
+    if ms_gsd_m is not None:
+        if ms_gsd_m > fine_gsd:
+            factor = int(round(ms_gsd_m / fine_gsd))
+            ms_coarse = downsample_block_mean(ms_fine, factor)
+            ms_transform = from_origin(bounds.bounds[0], bounds.bounds[3],
+                                       ms_gsd_m, ms_gsd_m)
+        else:
+            ms_coarse = ms_fine
+            ms_transform = transform
+        print(f"  Writing ms_5band.tif ({ms_gsd_m*100:.1f}cm)...")
+        write_geotiff(os.path.join(output_dir, 'ms_5band.tif'),
+                      ms_coarse, ms_transform, dtype='uint16', count=5)
+        with rasterio.open(os.path.join(output_dir, 'ms_5band.tif'), 'r+') as ds:
+            ds.descriptions = ('Blue', 'Green', 'Red', 'RedEdge', 'NIR')
+
+    print(f"  Writing dem_5m.tif (50cm GSD)...")
+    write_dem(os.path.join(output_dir, 'dem_5m.tif'), bounds, dem_gsd_m=0.5)
