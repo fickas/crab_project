@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import , GradScaler
 
 # ── Segmentation + augmentation ──
 import segmentation_models_pytorch as smp
@@ -633,7 +633,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
         images = images.to(device, non_blocking=True)
         masks  = masks.to(device,  non_blocking=True)
         optimizer.zero_grad()
-        with autocast():
+        with torch.amp.autocast(device_type, enabled=amp_enabled):
             logits = model(images)
             loss   = criterion(logits, masks)
         scaler.scale(loss).backward()
@@ -652,7 +652,7 @@ def validate(model, loader, criterion, metric, device):
     for images, masks in loader:
         images = images.to(device, non_blocking=True)
         masks  = masks.to(device,  non_blocking=True)
-        with autocast():
+        with torch.amp.autocast(device_type, enabled=amp_enabled):
             logits = model(images)
             loss   = criterion(logits, masks)
         total_loss += loss.item()
@@ -666,7 +666,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, scheduler,
           num_epochs, num_classes, ignore_index=255,
           ckpt_path=None,
           device='cuda', class_names=None):
-    scaler = GradScaler()
+    scaler = GradScaler(device='cuda')
     metric = IoUMetric(num_classes=6, classes_of_interest=[3, 4, 5])
     best_iou = 0.0
 
