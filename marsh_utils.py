@@ -47,6 +47,40 @@ import segmentation_models_pytorch as smp
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+# Synthetic-marsh constants (used by generate_marsh_geometry, assign_polygon_labels,
+# make_class_index_raster, composite_spectra, and the synth-data main())
+CRS = "EPSG:26919"
+SEED = 42
+# Class scheme — QGIS-style 1-indexed (model uses 0-indexed via QGIS_TO_MODEL)
+CLASSES = {
+    'other':              1,
+    'healthy_bank':       2,
+    'eroding_non_crab':   3,
+    'crab_edge':          4,
+    'crab_platform':      5,
+    'collapsed':          6,
+}
+# Per-class spectral signatures used by the synthetic data generator.
+# Order: Blue (475nm), Green (560nm), Red (668nm), RedEdge (717nm), NIR (842nm).
+# Values are reflectance in [0, 1], chosen to make NDVI/NDRE differentiable
+# between healthy, eroding, and crab-damaged states (see verification table
+# we computed earlier).
+SPECTRA = {
+    'water':            np.array([0.045, 0.055, 0.030, 0.020, 0.010]),
+    'marsh_platform':   np.array([0.055, 0.095, 0.050, 0.180, 0.300]),
+    'healthy_bank':     np.array([0.050, 0.100, 0.045, 0.200, 0.350]),
+    'eroding_non_crab': np.array([0.090, 0.130, 0.125, 0.180, 0.210]),
+    'crab_edge':        np.array([0.105, 0.140, 0.160, 0.165, 0.160]),
+    'crab_platform':    np.array([0.110, 0.135, 0.150, 0.155, 0.145]),
+    'collapsed':        np.array([0.125, 0.150, 0.170, 0.150, 0.105]),
+    'tree':             np.array([0.030, 0.075, 0.030, 0.250, 0.450]),
+}
+
+# Integer indices used in the class-index raster during rasterization;
+# offset by 10 to avoid colliding with anything that uses 0–9.
+SPECTRAL_IDX   = {k: 10 + i for i, k in enumerate(SPECTRA.keys())}
+IDX_TO_SPECTRA = {v: SPECTRA[k] for k, v in SPECTRAL_IDX.items()}
+
 #==============================================================
 
 def recommended_batch_size():
