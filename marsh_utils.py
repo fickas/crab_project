@@ -578,7 +578,7 @@ def ensure_slope(paths, dem_key='dem_high_res', units='degrees', out_key='slope'
 
 
 def ensure_tpi(paths, dem_key='dem_high_res', neighborhood_m=2.0, out_key='tpi'):
-    return _ensure_one(paths, dem_key, out_key, 'tpi.tif',
+    return _ensure_one(paths, dem_key, out_key, f'{out_key}.tif',
                        compute_tpi_raster, neighborhood_m=neighborhood_m)
 
 
