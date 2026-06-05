@@ -123,8 +123,8 @@ def run_band_experiment(
     best_iou = mu.train(
         model=model, train_loader=train_loader, val_loader=val_loader,
         criterion=criterion, optimizer=optimizer, scheduler=scheduler,
-        metric=metric, device=device, epochs=config_class.EPOCHS,
-        ckpt_path=ckpt_path, class_names=config_class.CLASS_NAMES,
+        num_epochs=config_class.EPOCHS, num_classes=config_class.N_CLASSES, ignore_index= config_class.IGNORE_INDEX,
+        ckpt_path=ckpt_path, device=device, class_names=config_class.CLASS_NAMES,
     )
 
     # ── 7. Reload best, run evaluation ──
