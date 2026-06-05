@@ -92,7 +92,7 @@ def run_band_experiment(
     # ── 3. Normalization stats ──
     stats_path = os.path.join(exp_dir, 'channel_stats.json')
     channel_means, channel_stds = mu.compute_channel_stats(
-        train_patches, stats_path, force=force
+        train_patches, stats_path
     )
 
     # ── 4. Datasets & loaders ──
