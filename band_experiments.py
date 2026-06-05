@@ -114,7 +114,7 @@ def run_band_experiment(
         classes=num_classes,
     ).to(device)
     criterion = mu.CombinedLoss(num_classes=num_classes, ignore_index=config_class.IGNORE_INDEX)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config_class.LR)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config_class.LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config_class.EPOCHS)
     metric    = mu.IoUMetric(num_classes=num_classes, ignore_index=config_class.IGNORE_INDEX)
     ckpt_path = os.path.join(exp_dir, 'best_model.pt')
