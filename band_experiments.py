@@ -96,10 +96,9 @@ def run_band_experiment(
     )
 
     # ── 4. Datasets & loaders ──
-    train_aug = mu.get_augmentations()
-    train_ds = mu.MarshSegmentationDataset(train_patches, channel_means, channel_stds, transforms=train_aug)
-    val_ds   = mu.MarshSegmentationDataset(val_patches,   channel_means, channel_stds)
-    test_ds  = mu.MarshSegmentationDataset(test_patches,  channel_means, channel_stds)
+    train_ds = mu.MarshSegmentationDataset(train_patches, augmentation=mu.get_augmentations('train', channel_means, channel_stds))
+    val_ds   = mu.MarshSegmentationDataset(val_patches,   augmentation=mu.get_augmentations('val',   channel_means, channel_stds))
+    test_ds  = mu.MarshSegmentationDataset(test_patches,  augmentation=mu.get_augmentations('test',  channel_means, channel_stds))
 
     bs = config_class.BATCH_SIZE
     train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True,  num_workers=2)
