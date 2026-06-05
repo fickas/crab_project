@@ -805,22 +805,7 @@ def _grids_match(src1, src2):
     )
 
 
-def build_patches_with_splits_multi(
-    paths,
-    band_spec,
-    polygons_gdf,
-    patch_size=256,
-    overlap=0.5,
-    block_size_m=100,
-    class_col='Class',
-    ignore_value=255,
-    priority=None,
-    train_frac=0.7,
-    val_frac=0.15,
-    seed=42,
-    require_labels=True,
-    resampling=Resampling.bilinear,
-):
+def build_patches_with_splits_multi(paths, polygons_gdf, cfg, resampling=Resampling.bilinear):
     """
     Multi-raster patch extractor with spatial split assignment.
 
@@ -849,6 +834,18 @@ def build_patches_with_splits_multi(
             split:            'train' / 'val' / 'test'
             block_id:         (block_x, block_y) tuple
     """
+    band_spec=cfg.BAND_SPEC
+    patch_size=cfg.PATCH_SIZE
+    overlap=cfg.OVERLAP
+    block_size_m=cfg.BLOCK_SIZE_M
+    priority=cfg.PRIORITY
+    train_frac=cfg.TRAIN_FRAC
+    val_frac=cfg.VAL_FRAC
+    seed=cfg.SEED
+    require_labels=cfg.REQUIRE_LABELS
+    class_col=cfg.CLASS_COLUMN
+    ignore_value = cfg.IGNORE_INDEX
+  
     if not band_spec:
         raise ValueError("band_spec must contain at least one entry")
 
