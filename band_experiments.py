@@ -81,7 +81,7 @@ def run_band_experiment(
     # ── 2. Build patches (with new BAND_SPEC) ──
     patches = list(mu.build_patches_with_splits_multi(
         paths=paths,
-        polygons_gdf=polys_gdf,
+        polygons_gdf=polygons_gdf,
         Config=config_class,
     ))
     train_patches = [p for p in patches if p.get('split') == 'train']
