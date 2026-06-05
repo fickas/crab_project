@@ -79,12 +79,11 @@ def run_band_experiment(
         ensure_fn(paths, **step_kwargs)
 
     # ── 2. Build patches (with new BAND_SPEC) ──
-    patches = mu.build_patches_with_splits_multi(
+    patches = list(mu.build_patches_with_splits_multi(
         paths=paths,
-        band_spec=band_spec,
-        polygons_gdf=polygons_gdf,
-        cfg=config_class,
-    )
+        polygons_gdf=polys_gdf,
+        Config=config_class,
+    ))
     train_patches = [p for p in patches if p.get('split') == 'train']
     val_patches   = [p for p in patches if p.get('split') == 'val']
     test_patches  = [p for p in patches if p.get('split') == 'test']
