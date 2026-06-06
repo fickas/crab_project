@@ -385,3 +385,36 @@ def view_perm_for_band(results, band_name):
     return (results['perm']
             .xs(band_name, level='band')['drop_mean']
             .unstack('class'))
+
+def view_perm_table(results, experiment_name, baseline=True):
+    """Per-class permutation drops for one experiment, formatted mean±std.
+
+    Returns a string-valued DataFrame (rows = bands, columns = classes) that
+    prints exactly like the live channel_permutation_importance_per_class output.
+    Set baseline=True to also print baseline per-class IoU above the table.
+    """
+    perm   = results['perm'].xs(experiment_name, level='experiment')
+    means  = perm['drop_mean'].unstack('class')
+    stds   = perm['drop_std'].unstack('class')
+    # preserve column order from BAND_SPEC ordering in the JSON
+    means  = means.reindex(perm.index.get_level_values('class').unique(), axis=1)
+    stds   = stds.reindex(means.columns, axis=1)
+
+    if baseline:
+        base = (results['perm']
+                .xs(experiment_name, level='experiment')['baseline_iou']
+                .groupby('class').first()
+                .reindex(means.columns))
+        print(f"Baseline per-class IoU for {experiment_name}:")
+        for cls, v in base.items():
+            print(f"  {cls:20s} {v:.4f}")
+        print()
+
+    print(f"Per-class permutation drops (mean ± std):")
+    formatted = pd.DataFrame(
+        {col: [f"{means.loc[idx, col]:+.3f}±{stds.loc[idx, col]:.3f}"
+               for idx in means.index]
+         for col in means.columns},
+        index=means.index,
+    )
+    return formatted
