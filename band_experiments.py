@@ -418,3 +418,34 @@ def view_perm_table(results, experiment_name, baseline=True):
         index=means.index,
     )
     return formatted
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def show_perm_grid(results, n_cols=2, figsize_per_cell=(6, 4)):
+    names = list(results['summary'].index)
+    n = len(names)
+    n_rows = (n + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols,
+                              figsize=(figsize_per_cell[0]*n_cols, figsize_per_cell[1]*n_rows))
+    axes = np.atleast_2d(axes).ravel()
+    
+    for i, name in enumerate(names):
+        df = (results['perm'].xs(name, level='experiment')['drop_mean']
+              .unstack('class'))
+        im = axes[i].imshow(df.values, cmap='RdYlGn', vmin=-0.1, vmax=0.7, aspect='auto')
+        axes[i].set_xticks(range(len(df.columns)))
+        axes[i].set_xticklabels(df.columns, rotation=45, ha='right')
+        axes[i].set_yticks(range(len(df.index)))
+        axes[i].set_yticklabels(df.index)
+        axes[i].set_title(name)
+        for r in range(df.shape[0]):
+            for c in range(df.shape[1]):
+                axes[i].text(c, r, f"{df.values[r,c]:+.2f}",
+                            ha='center', va='center',
+                            fontsize=8, color='black')
+    # Hide unused subplots
+    for i in range(n, len(axes)):
+        axes[i].axis('off')
+    fig.tight_layout()
+    return fig
