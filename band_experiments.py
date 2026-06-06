@@ -133,7 +133,7 @@ def run_band_experiment(
 
     val_pc  = mu.evaluate_precision_coverage(model, val_loader,  num_classes=num_classes,
                                               ignore_index=config_class.IGNORE_INDEX, device=device)
-    thresholds = mu.pick_thresholds(val_pc, target_precision=0.9)
+    thresholds = mu.pick_thresholds(val_pc, config_class.CLASSES_OF_INTEREST, target_precision=0.9)
     test_pc = mu.evaluate_precision_coverage(model, test_loader, num_classes=num_classes,
                                               ignore_index=config_class.IGNORE_INDEX, device=device)
     perm = mu.channel_permutation_importance_per_class(
