@@ -299,3 +299,89 @@ EXAMPLE_EXPERIMENTS = [
         ],
     },
 ]
+
+import glob
+import pandas as pd
+
+
+def load_band_experiment_results(experiments_dir):
+    """Load every summary.json in experiments_dir into structured DataFrames.
+
+    Returns a dict with three DataFrames:
+      'summary': indexed by experiment_name; high-level metrics
+                 columns: n_bands, bands, best_val_miou, best_epoch, train_min
+      'iou':     MultiIndex (experiment, class); column 'val_iou'
+      'perm':    MultiIndex (experiment, band, class);
+                 columns: drop_mean, drop_std, baseline_iou
+    """
+    rows_summary, rows_iou, rows_perm = [], [], []
+    for fp in sorted(glob.glob(os.path.join(experiments_dir, '*/summary.json'))):
+        with open(fp) as f:
+            s = json.load(f)
+        name = s['experiment_name']
+
+        rows_summary.append({
+            'experiment':    name,
+            'n_bands':       s['n_channels'],
+            'bands':         ', '.join(s['band_names']),
+            'best_val_miou': s['best_val_miou'],
+            'best_epoch':    s['best_epoch'],
+            'train_min':     s['training_time_min'],
+        })
+
+        for c, class_name in enumerate(s['class_names']):
+            iou = s['iou_per_class'][c] if c < len(s['iou_per_class']) else float('nan')
+            rows_iou.append({'experiment': name, 'class': class_name, 'val_iou': iou})
+
+        perm = s['permutation_importance']
+        for ch, band in enumerate(s['band_names']):
+            for c, class_name in enumerate(s['class_names']):
+                rows_perm.append({
+                    'experiment':   name,
+                    'band':         band,
+                    'class':        class_name,
+                    'drop_mean':    perm['drops_mean'][ch][c],
+                    'drop_std':     perm['drops_std'][ch][c],
+                    'baseline_iou': perm['baseline_iou'][c],
+                })
+
+    return {
+        'summary': pd.DataFrame(rows_summary).set_index('experiment'),
+        'iou':     pd.DataFrame(rows_iou).set_index(['experiment', 'class']),
+        'perm':    pd.DataFrame(rows_perm).set_index(['experiment', 'band', 'class']),
+    }
+
+
+# ─── Common views — pick whichever question you're asking ───
+def view_summary(results):
+    """One row per experiment, sorted by val mIoU. Quick comparison."""
+    return results['summary'].sort_values('best_val_miou', ascending=False)
+
+
+def view_iou_matrix(results):
+    """experiment × class matrix of val IoU. Catches 'this combo killed class X'."""
+    return results['iou']['val_iou'].unstack('class')
+
+
+def view_perm_for_experiment(results, experiment_name):
+    """For one experiment, band × class matrix of permutation drops.
+    Answers: 'in THIS combo, which band carries which class?'"""
+    return (results['perm']
+            .xs(experiment_name, level='experiment')['drop_mean']
+            .unstack('class'))
+
+
+def view_perm_for_class(results, class_name):
+    """For one class, experiment × band matrix of permutation drops.
+    Answers: 'which band is doing the work for crab_platform, across combos?'"""
+    return (results['perm']
+            .xs(class_name, level='class')['drop_mean']
+            .unstack('band'))
+
+
+def view_perm_for_band(results, band_name):
+    """For one band, experiment × class matrix of permutation drops.
+    Answers: 'does NDRE earn its place, and for which classes?'"""
+    return (results['perm']
+            .xs(band_name, level='band')['drop_mean']
+            .unstack('class'))
