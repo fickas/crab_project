@@ -2492,3 +2492,66 @@ def generate_dataset(output_dir, bounds, geom, polygons_gdf, dataset_name,
     print(f"  Writing dem_5m.tif at imagery GSD ({imagery_gsd*100:.1f}cm)...")
     write_dem(os.path.join(output_dir, 'dem_5m.tif'),
               bounds, dem_gsd_m=imagery_gsd, geom=geom)
+
+def compute_confusion_matrix(model, loader, num_classes,
+                              ignore_index=255, device='cuda'):
+    """Pixel-level confusion matrix on a dataloader.
+    Returns array cm[true, pred] of pixel counts."""
+    import torch, numpy as np
+    model.eval()
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    with torch.no_grad():
+        for batch in loader:
+            x = batch['image'].to(device)
+            y = batch['mask'].to(device)
+            logits = model(x)
+            pred = logits.argmax(dim=1)
+            mask = (y != ignore_index)
+            y_flat = y[mask].cpu().numpy()
+            p_flat = pred[mask].cpu().numpy()
+            np.add.at(cm, (y_flat, p_flat), 1)
+    return cm
+
+
+def display_confusion_matrix(cm, class_names, normalize='recall', ax=None):
+    """Display confusion matrix as heatmap.
+    normalize:
+      'none'      — raw pixel counts
+      'recall'    — row-normalized (P(pred|true))
+      'precision' — col-normalized (P(true|pred))
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    cm = np.array(cm, dtype=np.float64)
+    if normalize == 'recall':
+        cm = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
+        fmt = '.2f'
+        cbar_label = 'P(pred | true) — recall'
+    elif normalize == 'precision':
+        cm = cm / cm.sum(axis=0, keepdims=True).clip(min=1)
+        fmt = '.2f'
+        cbar_label = 'P(true | pred) — precision'
+    else:
+        fmt = ',.0f'
+        cbar_label = 'Pixel count'
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(cm, cmap='Blues', vmin=0,
+                   vmax=cm.max() if normalize == 'none' else 1.0)
+    ax.set_xticks(range(len(class_names)))
+    ax.set_xticklabels(class_names, rotation=45, ha='right')
+    ax.set_yticks(range(len(class_names)))
+    ax.set_yticklabels(class_names)
+    ax.set_xlabel('Predicted')
+    ax.set_ylabel('True')
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, format(cm[i, j], fmt),
+                    ha='center', va='center',
+                    color='white' if cm[i, j] > thresh else 'black',
+                    fontsize=9)
+    plt.colorbar(im, ax=ax, label=cbar_label)
+    plt.tight_layout()
