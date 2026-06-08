@@ -2514,29 +2514,21 @@ def compute_confusion_matrix(model, loader, num_classes,
 
 
 def display_confusion_matrix(cm, class_names, normalize='recall', ax=None):
-    """Display confusion matrix as heatmap.
-    normalize:
-      'none'      — raw pixel counts
-      'recall'    — row-normalized (P(pred|true))
-      'precision' — col-normalized (P(true|pred))
-    """
     import matplotlib.pyplot as plt
     import numpy as np
 
     cm = np.array(cm, dtype=np.float64)
     if normalize == 'recall':
         cm = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
-        fmt = '.2f'
-        cbar_label = 'P(pred | true) — recall'
+        fmt, cbar_label = '.2f', 'P(pred | true) — recall'
     elif normalize == 'precision':
         cm = cm / cm.sum(axis=0, keepdims=True).clip(min=1)
-        fmt = '.2f'
-        cbar_label = 'P(true | pred) — precision'
+        fmt, cbar_label = '.2f', 'P(true | pred) — precision'
     else:
-        fmt = ',.0f'
-        cbar_label = 'Pixel count'
+        fmt, cbar_label = ',.0f', 'Pixel count'
 
-    if ax is None:
+    created_own_fig = ax is None
+    if created_own_fig:
         fig, ax = plt.subplots(figsize=(8, 6))
     im = ax.imshow(cm, cmap='Blues', vmin=0,
                    vmax=cm.max() if normalize == 'none' else 1.0)
@@ -2555,3 +2547,5 @@ def display_confusion_matrix(cm, class_names, normalize='recall', ax=None):
                     fontsize=9)
     plt.colorbar(im, ax=ax, label=cbar_label)
     plt.tight_layout()
+    if created_own_fig:
+        plt.show()        # ← flush this figure before next loop iteration
