@@ -578,7 +578,87 @@ def compute_laplacian_raster(src_path, out_path, band=1):
         _write_derived_raster(out_path, lap, src)
     print(f"  wrote Laplacian to {out_path}")
 
+def compute_local_range(src_path, out_path, window_m=0.3):
+    """Local max - min in a window. Roughness/texture indicator.
+    On DEM: how much elevation varies across the window — picks up burrow pock-marks.
+    On pan: brightness range — picks up texture transitions."""
+    import rasterio, numpy as np
+    from scipy import ndimage
+    with rasterio.open(src_path) as src:
+        data = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+        gsd_m = abs(src.transform.a)
+    window_px = max(3, int(round(window_m / gsd_m)))
+    if window_px % 2 == 0:
+        window_px += 1
+    out = (ndimage.maximum_filter(data, size=window_px) -
+           ndimage.minimum_filter(data, size=window_px)).astype(np.float32)
+    profile.update(dtype='float32', count=1, compress='deflate', predictor=3)
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(out, 1)
 
+
+def compute_local_entropy(src_path, out_path, window_m=0.3, n_bins=16):
+    """Shannon entropy of quantized values in a local window. Higher = more variety.
+    Crab-burrowed areas have more spatial heterogeneity than smooth marsh platform."""
+    import rasterio, numpy as np
+    from scipy import ndimage
+    with rasterio.open(src_path) as src:
+        data = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+        gsd_m = abs(src.transform.a)
+    valid = np.isfinite(data) & (data > 0)
+    vmin, vmax = (np.percentile(data[valid], [1, 99]) if valid.any() else (0, 1))
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+    bin_idx = np.clip(((data - vmin) / (vmax - vmin) * n_bins).astype(np.int32),
+                      0, n_bins - 1)
+    window_px = max(3, int(round(window_m / gsd_m)))
+    if window_px % 2 == 0:
+        window_px += 1
+    entropy = np.zeros_like(data, dtype=np.float32)
+    for b in range(n_bins):
+        p = ndimage.uniform_filter((bin_idx == b).astype(np.float32), size=window_px)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            entropy += np.where(p > 0, -p * np.log(p), 0)
+    profile.update(dtype='float32', count=1, compress='deflate', predictor=3)
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(entropy, 1)
+
+
+def compute_dem_tri(dem_path, out_path):
+    """Terrain Ruggedness Index (Riley 1999): mean absolute elevation difference
+    from center pixel to 8 neighbors. Direct measure of micro-topographic roughness."""
+    import rasterio, numpy as np
+    with rasterio.open(dem_path) as src:
+        dem = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+    tri = np.zeros_like(dem)
+    n = 0
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            tri += np.abs(dem - np.roll(np.roll(dem, dy, axis=0), dx, axis=1))
+            n += 1
+    tri = (tri / n).astype(np.float32)
+    profile.update(dtype='float32', count=1, compress='deflate', predictor=3)
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(tri, 1)
+
+
+# ensure_* wrappers
+def ensure_local_range(paths, src_key='pan_orthomosaic', window_m=0.3, out_key='local_range'):
+    return _ensure_one(paths, src_key, out_key, f'{out_key}.tif',
+                       compute_local_range, window_m=window_m)
+
+def ensure_local_entropy(paths, src_key='pan_orthomosaic', window_m=0.3, out_key='local_entropy'):
+    return _ensure_one(paths, src_key, out_key, f'{out_key}.tif',
+                       compute_local_entropy, window_m=window_m)
+
+def ensure_dem_tri(paths, dem_key='dem_high_res', out_key='dem_tri'):
+    return _ensure_one(paths, dem_key, out_key, f'{out_key}.tif', compute_dem_tri)
+  
 # ============================================================================
 # ensure_* wrappers — follow the existing ensure_indices pattern
 # ============================================================================
