@@ -2114,31 +2114,41 @@ def branching_tributary(parent_line, parent_t, length, angle_deg,
 
 
 def generate_marsh_geometry(bounds, rng):
-    """Generate channels, banks, trees, hummock, and ponds."""
+    """Generate channels, banks, trees, hummock, and ponds.
+
+    Bumped tributary count (5 → 8) and sub-tributary frequency so the M1 window
+    contains more bank polygons across all class characters.
+    """
     xmin, ymin, xmax, ymax = bounds.bounds
-    cx = (xmin + xmax) / 2     # ← add these two lines
+    cx = (xmin + xmax) / 2
     cy = (ymin + ymax) / 2
 
+    # ── Main channel — north-south sinuous, slight diagonal ──
     main = sinuous_line(
         start=(xmin + 25, ymax - 3),
         end=(xmin + 35, ymin + 3),
         n_points=140, amplitude=10.0, n_waves=3.0, noise_amp=2.0, rng=rng,
     )
 
+    # ── Main tributaries — denser spacing along the main channel ──
     tribs = []
     for parent_t, angle, length in [
-        (0.18, 70,  60),
-        (0.32, 85,  75),
-        (0.48, 95,  85),
-        (0.62, 80,  78),
-        (0.78, 75,  65),
+        (0.12, 70,  55),
+        (0.22, 85,  65),
+        (0.32, 95,  75),
+        (0.42, 80,  70),
+        (0.52, 75,  60),
+        (0.62, 90,  72),
+        (0.72, 100, 65),
+        (0.82, 85,  55),
     ]:
         tribs.append(branching_tributary(main, parent_t, length, angle, rng=rng))
 
+    # ── Sub-tributaries — higher branching probability ──
     sub_tribs = []
     for trib in tribs:
-        if rng.random() > 0.3:
-            for _ in range(rng.integers(1, 3)):
+        if rng.random() > 0.2:                  # was 0.3
+            for _ in range(rng.integers(1, 4)): # was 1..3
                 t_branch = rng.uniform(0.3, 0.8)
                 angle    = rng.choice([-60, -45, 45, 60]) + rng.normal(0, 10)
                 length   = rng.uniform(15, 35)
@@ -2147,7 +2157,8 @@ def generate_marsh_geometry(bounds, rng):
                     amplitude=1.5, n_waves=1.2, rng=rng,
                 ))
 
-    main_water = main.buffer(4.0, cap_style=2)
+    # ── Water and bank buffers ──
+    main_water  = main.buffer(4.0, cap_style=2)
     trib_waters = [t.buffer(1.0, cap_style=2) for t in tribs]
     sub_waters  = [s.buffer(0.5, cap_style=2) for s in sub_tribs]
     all_water   = unary_union([main_water] + trib_waters + sub_waters).intersection(bounds)
@@ -2155,39 +2166,48 @@ def generate_marsh_geometry(bounds, rng):
     main_bank  = main_water.buffer(2.5).difference(main_water)
     trib_bank  = unary_union([w.buffer(1.0).difference(w) for w in trib_waters])
     sub_bank   = unary_union([w.buffer(0.4).difference(w) for w in sub_waters])
-    all_banks  = unary_union([main_bank, trib_bank, sub_bank]).intersection(bounds).difference(all_water)
+    all_banks  = (unary_union([main_bank, trib_bank, sub_bank])
+                  .intersection(bounds).difference(all_water))
 
+    # ── Trees along the bottom edge ──
     bottom_pts = [(xmin, ymin)]
     for x in np.linspace(xmin, xmax, 30):
         bottom_pts.append((x, ymin + 12 + rng.uniform(-4, 12)))
     bottom_pts.append((xmax, ymin))
     bottom_trees = Polygon(bottom_pts).buffer(0)
 
+    # ── Trees along the right edge ──
     right_pts = [(xmax, ymax)]
     for y in np.linspace(ymax, ymin + 30, 25):
         right_pts.append((xmax + rng.uniform(-12, -2), y))
     right_pts.append((xmax, ymin + 30))
     right_trees = Polygon(right_pts).buffer(0)
+
     all_trees = unary_union([bottom_trees, right_trees]).intersection(bounds).difference(all_water)
 
+    # ── Hummock — vegetated island in the marsh ──
     hum_center = (cx + 30, cy + 15)
     hum_pts = []
     for theta in np.linspace(0, 2*np.pi, 30):
         r = 10 + rng.uniform(-3, 3)
-        hum_pts.append((hum_center[0] + r*np.cos(theta), hum_center[1] + r*np.sin(theta)))
+        hum_pts.append((hum_center[0] + r*np.cos(theta),
+                        hum_center[1] + r*np.sin(theta)))
     hummock = Polygon(hum_pts).buffer(0).intersection(bounds).difference(all_water)
 
+    # ── Ponds — small marsh-interior depressions ──
     ponds = []
     for _ in range(3):
-        cx = rng.uniform(xmin + 40, xmax - 20)
-        cy = rng.uniform(ymin + 35, ymax - 20)
-        r  = rng.uniform(1.5, 3.0)
+        pond_cx = rng.uniform(xmin + 40, xmax - 20)     # renamed from cx
+        pond_cy = rng.uniform(ymin + 35, ymax - 20)     # renamed from cy
+        r       = rng.uniform(1.5, 3.0)
         p_pts = []
         for theta in np.linspace(0, 2*np.pi, 16):
             rr = r + rng.uniform(-0.3, 0.3)
-            p_pts.append((cx + rr*np.cos(theta), cy + rr*np.sin(theta)))
+            p_pts.append((pond_cx + rr*np.cos(theta),
+                          pond_cy + rr*np.sin(theta)))
         ponds.append(Polygon(p_pts))
-    all_ponds = unary_union(ponds).intersection(bounds).difference(all_water).difference(all_banks)
+    all_ponds = (unary_union(ponds).intersection(bounds)
+                 .difference(all_water).difference(all_banks))
 
     return dict(
         main_channel=main,
