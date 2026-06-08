@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project develops automated detection of *Sesarma reticulatum* (purple marsh crab) burrow damage along salt-marsh channels using drone-collected high-resolution imagery (Wellfleet, MA). Crab burrowing is a key driver of New England marsh die-off and currently has to be mapped by hand from aerial photos or kayak surveys — neither approach scales to the regional monitoring we need.
+This project develops automated detection of *Sesarma reticulatum* (purple marsh crab) burrow damage along salt-marsh channels using drone-collected high-resolution imagery (Wellfleet, MA). Crab burrowing is a key driver of New England marsh die-off and currently has to be mapped by hand from aerial photos or walking/kayak surveys — neither approach scales to the regional monitoring we need.
 
 Our approach uses a two-tier deep-learning segmentation pipeline:
 
@@ -34,7 +34,7 @@ The pipeline uses an *open-world* labeling strategy: unlabeled pixels (ignore in
 
 ### 1. Shared Code Repository
 
-A standalone GitHub repository (`marsh-crab/`) containing:
+A standalone GitHub repository (`crab_project/`) containing:
 
 - `marsh_utils.py` — utility functions and project-wide constants (class scheme, conversion mappings, IO helpers, training and inference functions)
 - `band_experiments.py` — harness for systematic band-combination experiments
@@ -46,7 +46,7 @@ Notebooks pull the repo via `git clone` (with `git pull` for updates) at the top
 
 ### 2. Synthetic Data Generator
 
-A procedural synthetic-marsh generator produces realistic test datasets without requiring drone flights. This unblocked pipeline development ahead of the flight window.
+A procedural synthetic-marsh generator produces realistic test datasets without requiring drone flights. This unblocked pipeline development ahead of the flight window. The data is driven by a screenshot given to Claude of entire Wellfleet marsh. Claude then used this to generate realistic data.
 
 - Procedural channel and tributary geometry with biologically plausible characters (healthy, eroding, crab-damaged, mixed)
 - Per-class spectral signatures calibrated to produce realistic NDVI/NDRE separation between classes
