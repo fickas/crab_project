@@ -9,7 +9,7 @@ This project develops automated detection of *Sesarma reticulatum* (purple marsh
 Our approach uses a two-tier deep-learning segmentation pipeline:
 
 - **Model 1** trains on 1 cm imagery flown low along marsh channels and produces high-confidence polygons of damaged bank segments (5 bank-state classes plus "other").
-- **Model 2** trains on 4 cm imagery flown at higher altitude across the full marsh, using Model 1's polygons as supervision plus hand-labeled non-bank polygons (trees, ponds, hummocks, mud, healthy marsh interior).
+- **Model 2** trains on 4 cm imagery flown at a higher altitude across the full marsh, using Model 1's polygons as supervision plus hand-labeled non-bank polygons (trees, ponds, hummocks, mud, healthy marsh interior).
 
 ## Hardware and Imagery
 
@@ -21,7 +21,7 @@ Our approach uses a two-tier deep-learning segmentation pipeline:
 
 ## Class Scheme
 
-Note this is preliminary and may change as we get to view actual flight images. I have build it as a paramemeter that is easy to change in the pipeline.
+Note this is preliminary and may change as we get to view actual flight images. I have built it as a parameter that is easy to change in the pipeline.
 
 Also note that, contrary to at least one paper the team has referenced, the U-Net architecture has no problem with multiple classes.
 
@@ -56,7 +56,7 @@ A procedural synthetic-marsh generator produces realistic test datasets without 
 
 - Procedural channel and tributary geometry with biologically plausible characters (healthy, eroding, crab-damaged, mixed)
 - Per-class spectral signatures calibrated to produce realistic NDVI/NDRE separation between classes
-- DEM with channel-cutting topography (channels sit ~40 cm below marsh platform) and realistic surface roughness
+- DEM with channel-cutting topography (channels sit ~40 cm below the marsh platform) and realistic surface roughness
 - Two-tier output matching real-data layout: 60 m × 60 m at 1 cm for Model 1, 150 m × 150 m at 4 cm for Model 2
 - Class balancing via biased character distribution so all 6 classes have adequate training representation
 
