@@ -6,6 +6,8 @@
 
 This project develops automated detection of *Sesarma reticulatum* (purple marsh crab) burrow damage along salt-marsh channels using drone-collected high-resolution imagery (Wellfleet, MA). Crab burrowing is a key driver of New England marsh die-off and currently has to be mapped by hand from aerial photos or kayak surveys — neither approach scales to the regional monitoring we need.
 
+We deliberately chose semantic segmentation (pixel-level classification) over object detection (e.g., YOLO bounding boxes). This reflects what we ultimately want to measure: rather than counting individual burrows to estimate abundance, we quantify the *area* of marsh affected by crab damage. Damage extent is more directly tied to the ecological outcome (marsh loss, lost vegetation, lost sediment-trapping capacity) and more robust to the imaging variations — lighting, partial occlusion, burrow age, vegetation regrowth — that make consistent individual-burrow detection difficult, particularly at the 4cm resolution we have to work with.
+
 Our approach uses a two-tier deep-learning segmentation pipeline:
 
 - **Model 1** trains on 1 cm imagery flown low along marsh channels and produces high-confidence polygons of damaged bank segments (5 bank-state classes plus "other").
