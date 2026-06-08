@@ -1,5 +1,7 @@
 # Crab Burrow Segmentation — Progress Report
 
+## Stephen Fickas, June 2026
+
 ## Project Overview
 
 This project develops automated detection of *Sesarma reticulatum* (purple marsh crab) burrow damage along salt-marsh channels using drone-collected high-resolution imagery (Wellfleet, MA). Crab burrowing is a key driver of New England marsh die-off and currently has to be mapped by hand from aerial photos or kayak surveys — neither approach scales to the regional monitoring we need.
@@ -19,6 +21,10 @@ Our approach uses a two-tier deep-learning segmentation pipeline:
 
 ## Class Scheme
 
+Note this is preliminary and may change as we get to view actual flight images. I have build it as a paramemeter that is easy to change in the pipeline.
+
+Also note that, contrary to at least one paper the team has referenced, the U-Net architecture has no problem with multiple classes.
+
 | Index | Class | Description |
 |---|---|---|
 | 0 | other | Non-bank features (water, trees, hummocks, ponds, marsh interior) |
@@ -34,7 +40,7 @@ The pipeline uses an *open-world* labeling strategy: unlabeled pixels (ignore in
 
 ### 1. Shared Code Repository
 
-A standalone GitHub repository (`marsh-crab/`) containing:
+A standalone GitHub repository (`crab_project/`) containing:
 
 - `marsh_utils.py` — utility functions and project-wide constants (class scheme, conversion mappings, IO helpers, training and inference functions)
 - `band_experiments.py` — harness for systematic band-combination experiments
@@ -46,7 +52,7 @@ Notebooks pull the repo via `git clone` (with `git pull` for updates) at the top
 
 ### 2. Synthetic Data Generator
 
-A procedural synthetic-marsh generator produces realistic test datasets without requiring drone flights. This unblocked pipeline development ahead of the flight window.
+A procedural synthetic-marsh generator produces realistic test datasets without requiring drone flights. This unblocked pipeline development ahead of the flight window. Claude created this generator using a screenshot from QGis of the entire Wellfleet marsh along with images collected by team members who took photos while walking or kayaking the marsh. Fairly impressive.
 
 - Procedural channel and tributary geometry with biologically plausible characters (healthy, eroding, crab-damaged, mixed)
 - Per-class spectral signatures calibrated to produce realistic NDVI/NDRE separation between classes
@@ -81,11 +87,13 @@ The character distribution across the marsh's 8+ tributaries is biased toward `c
 
 This is more crab-damage-dense than a real marsh — which is the point: ensure the model sees enough examples of each class to learn it, since real-data scarcity is something we can't control.
 
-**Why the spatial split needs care on synthetic data.** Our anti-leakage train/val/test split assigns whole 100 m blocks to each set (to prevent train/val patches from spatially overlapping). On real marsh imagery hundreds of meters across this is fine. On synthetic data, the small extents (30-60 m) yield very few blocks at 100 m, so the split often produces empty val or test sets. We address this by using `BLOCK_SIZE_M=3` (synthetic Model 1) or `BLOCK_SIZE_M=15` (synthetic Model 2), which still maintains spatial separation but produces 100+ blocks per dataset. The `EXTENT_M // 10` heuristic falls out of this and recovers `BLOCK_SIZE_M=100` for real-data extents automatically.
+**Why the spatial split needs care on synthetic data.** Our anti-leakage train/val/test split assigns entire 100 m blocks to each set (to prevent train/val patches from overlapping spatially). On real marsh imagery, hundreds of meters across, this is fine. On synthetic data, the small extents (30-60 m) yield very few blocks at 100 m, so the split often produces empty val or test sets. We address this by using `BLOCK_SIZE_M=3` (synthetic Model 1) or `BLOCK_SIZE_M=15` (synthetic Model 2), which still maintains spatial separation but produces 100+ blocks per dataset. The `EXTENT_M // 10` heuristic falls out of this and recovers `BLOCK_SIZE_M=100` for real-data extents automatically.
 
 ### 3. Derived Band Library
 
 The model takes a configurable list of input bands — the panchromatic image alone is informative, but pairing it with derived bands gives the network access to physical signals (vegetation health, surface roughness, channel proximity) that are otherwise hard to learn from raw pixel values. We've implemented 14+ derived bands across four categories, each with an `ensure_*` wrapper that handles caching and dependency ordering.
+
+Note that it may seem intuitive to add most or all of these bands into each image given to model 1, i.e., each image contains 14 bands of information. Isn't more information better? In general, no. In practice, 3 bands and perhaps a few more are typically the sweet spot. The challenge is to find the smallest subset of the bands that yields the best results. Below are the bands that are being considered.
 
 **Spectral indices** (computed from the pansharpened MS at 1 cm). These transform the 5 raw multispectral bands into single-channel rasters that respond to specific properties of the surface:
 
@@ -237,7 +245,7 @@ The point of `margin_abstain` over `argmax_abstain` is that it specifically dete
 
 ## Preliminary Findings (Synthetic Data)
 
-The synthetic-data confusion matrices revealed several insights ahead of real-data flights. These should be treated as hypotheses to confirm rather than conclusions:
+The synthetic-data confusion matrices revealed several insights ahead of real-data flights. Given both the speculative class breakout and the synthetic nature of this data, I would use this more as a guide to the kinds of things we may find in our final results.
 
 1. **The dominant failure mode is intra-bank confusion**, specifically `crab_edge` getting predicted as `healthy_bank`. Roughly half of true `crab_edge` pixels go to `healthy_bank` under argmax. This is the discrimination that matters most ecologically and is the right target for further work.
 
@@ -303,7 +311,7 @@ A separate caveat: the most recent training run also had several validation clas
 
 For readers from different backgrounds — terms used throughout this report.
 
-**Argmax** — Decision rule that selects the highest-probability class from a softmax output. The simplest possible inference rule.
+**Argmax** — Machine learning models typically provide a probability for each class, given an input image. These probabilities are normalized to 1 across all classes, e.g., with 6 classes, the 6 probabilities would add to 1.0. This is called softmax. Argmax is a decision rule that selects the highest-probability class from a softmax output. The simplest possible inference rule. The problem arises when no single probability is dominant. That leads us to consider other approaches (see section 7).
 
 **BAND_SPEC** — Configuration list specifying which derived bands the model receives as input channels (e.g., `[('pan_orthomosaic', 1), ('ndvi', 1), ('tpi_small', 1)]`).
 
