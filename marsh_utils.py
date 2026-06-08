@@ -2649,3 +2649,44 @@ def display_confusion_matrix(cm, class_names, normalize='recall', ax=None):
     plt.tight_layout()
     if created_own_fig:
         plt.show()        # ← flush this figure before next loop iteration
+
+def rule_argmax_abstain(probs, min_confidence=0.5, abstain_label=255):
+    """Argmax, but mark pixel as 'abstain' if no class exceeds min_confidence."""
+    import numpy as np
+    pred = probs.argmax(axis=1)
+    pred[probs.max(axis=1) < min_confidence] = abstain_label
+    return pred
+
+
+def rule_margin_abstain(probs, min_margin=0.15, abstain_label=255):
+    """Argmax, but abstain if top1 - top2 < min_margin (top two classes too close)."""
+    import numpy as np
+    sorted_probs = np.sort(probs, axis=1)
+    margin = sorted_probs[:, -1] - sorted_probs[:, -2]
+    pred = probs.argmax(axis=1)
+    pred[margin < min_margin] = abstain_label
+    return pred
+
+
+def rule_entropy_abstain(probs, max_entropy=1.5, abstain_label=255):
+    """Argmax, but abstain if Shannon entropy of probs > max_entropy.
+    For 6 classes, max possible entropy = log(6) ≈ 1.79 (uniform distribution)."""
+    import numpy as np
+    entropy = -np.sum(probs * np.log(probs + 1e-10), axis=1)
+    pred = probs.argmax(axis=1)
+    pred[entropy > max_entropy] = abstain_label
+    return pred
+
+def rule_margin_with_tie_info(probs, min_margin=0.15, abstain_label=255):
+    """Like rule_margin_abstain, but also returns which two classes were tied."""
+    import numpy as np
+    sorted_idx = np.argsort(probs, axis=1)
+    sorted_probs = np.take_along_axis(probs, sorted_idx, axis=1)
+    margin = sorted_probs[:, -1] - sorted_probs[:, -2]
+    pred = probs.argmax(axis=1)
+    tied = margin < min_margin
+    pred[tied] = abstain_label
+    # tied_pairs: (n_pixels, 2) — top-2 class indices for tied pixels
+    top1 = sorted_idx[:, -1]
+    top2 = sorted_idx[:, -2]
+    return pred, np.stack([top1[tied], top2[tied]], axis=1)
