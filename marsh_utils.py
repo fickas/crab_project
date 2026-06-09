@@ -1960,6 +1960,7 @@ def predict_full_raster(
             blockysize=256,
             nodata=None,
         )
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with rasterio.open(output_path, 'w', **profile) as dst:
             for c in range(cfg.N_CLASSES):
                 dst.write(probs_final[c].astype(np.float32), c + 1)
