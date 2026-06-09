@@ -2216,6 +2216,102 @@ def generate_marsh_geometry(bounds, rng):
         all_trees=all_trees, hummock=hummock, all_ponds=all_ponds,
     )
 
+def generate_other_handlabels(geom, bounds, rng,
+                               n_marsh_interior=10,
+                               n_mud_patches=5,
+                               n_wrack=3):
+    """Generate synthetic 'hand-labeled' polygons for Model 2's 'other' class.
+    
+    Combines geometric features (trees, hummock, ponds) with simulated marsh-interior,
+    mud-patch, and wrack-line polygons — capturing the variety a human would label
+    in QGIS over real 4cm imagery.
+    
+    All output polygons get Class = CLASSES['other'].
+    """
+    from shapely.geometry import Polygon, MultiPolygon
+    
+    xmin, ymin, xmax, ymax = bounds.bounds
+    extent_x = xmax - xmin
+    extent_y = ymax - ymin
+    rows = []
+    
+    def _add_geom(g, min_area=0.5):
+        if g.is_empty: return
+        if isinstance(g, MultiPolygon):
+            for p in g.geoms:
+                if p.area > min_area:
+                    rows.append({'Class': CLASSES['other'], 'geometry': p})
+        else:
+            rows.append({'Class': CLASSES['other'], 'geometry': g})
+    
+    # 1) Pre-existing geometric features
+    _add_geom(geom['all_trees'], min_area=1.0)
+    _add_geom(geom['hummock'])
+    _add_geom(geom['all_ponds'])
+    
+    # 2) Random marsh-interior 'other' patches (irregular, mid-size)
+    placed, attempts = 0, 0
+    while placed < n_marsh_interior and attempts < 100:
+        attempts += 1
+        cx = rng.uniform(xmin + 0.15*extent_x, xmax - 0.15*extent_x)
+        cy = rng.uniform(ymin + 0.20*extent_y, ymax - 0.15*extent_y)
+        r = rng.uniform(0.8, 2.5)
+        n_verts = rng.integers(8, 14)
+        pts = []
+        for theta in np.linspace(0, 2*np.pi, n_verts, endpoint=False):
+            rr = r * rng.uniform(0.6, 1.4)   # irregular boundary
+            pts.append((cx + rr*np.cos(theta), cy + rr*np.sin(theta)))
+        poly = Polygon(pts)
+        if poly.intersects(geom['all_water']) or poly.intersects(geom['all_banks']):
+            continue
+        rows.append({'Class': CLASSES['other'], 'geometry': poly})
+        placed += 1
+    
+    # 3) Mud patches near channels (small, beyond the bank zone)
+    placed, attempts = 0, 0
+    while placed < n_mud_patches and attempts < 100:
+        attempts += 1
+        try:
+            channel_pt = geom['all_water'].representative_point()
+        except Exception:
+            break
+        angle = rng.uniform(0, 2*np.pi)
+        dist  = rng.uniform(3, 8)
+        cx, cy = channel_pt.x + dist*np.cos(angle), channel_pt.y + dist*np.sin(angle)
+        if not (xmin < cx < xmax and ymin < cy < ymax):
+            continue
+        r = rng.uniform(0.4, 1.2)
+        n_verts = rng.integers(6, 10)
+        pts = [(cx + r*rng.uniform(0.7, 1.3)*np.cos(t),
+                cy + r*rng.uniform(0.7, 1.3)*np.sin(t))
+               for t in np.linspace(0, 2*np.pi, n_verts, endpoint=False)]
+        poly = Polygon(pts)
+        if poly.intersects(geom['all_water']) or poly.intersects(geom['all_banks']):
+            continue
+        rows.append({'Class': CLASSES['other'], 'geometry': poly})
+        placed += 1
+    
+    # 4) Wrack-like elongated polygons (debris deposited by tides)
+    placed, attempts = 0, 0
+    while placed < n_wrack and attempts < 50:
+        attempts += 1
+        cx = rng.uniform(xmin + 0.2*extent_x, xmax - 0.2*extent_x)
+        cy = rng.uniform(ymin + 0.2*extent_y, ymax - 0.2*extent_y)
+        angle  = rng.uniform(0, 2*np.pi)
+        length = rng.uniform(2.0, 5.0)
+        width  = rng.uniform(0.3, 0.6)
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+        local_pts = [(-length/2, -width/2), (length/2, -width/2),
+                     (length/2,  width/2), (-length/2,  width/2)]
+        pts = [(cx + p[0]*cos_a - p[1]*sin_a, cy + p[0]*sin_a + p[1]*cos_a)
+               for p in local_pts]
+        poly = Polygon(pts)
+        if poly.intersects(geom['all_water']) or poly.intersects(geom['all_banks']):
+            continue
+        rows.append({'Class': CLASSES['other'], 'geometry': poly})
+        placed += 1
+    
+    return gpd.GeoDataFrame(rows, geometry='geometry', crs=CRS)
 
 # ============================================================================
 # Polygon label assignment
