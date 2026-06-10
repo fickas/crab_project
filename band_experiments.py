@@ -216,6 +216,7 @@ def run_band_experiments(experiments, base_paths, polygons_gdf, config_class,
             row[f'iou_{name}'] = iou
         rows.append(row)
     df = pd.DataFrame(rows)
+    os.makedirs(output_dir_root, exist_ok=True)
     csv_path = os.path.join(output_dir_root, 'experiments_summary.csv')
     df.to_csv(csv_path, index=False)
     print(f"\n{'='*70}\nWrote summary CSV → {csv_path}\n{'='*70}")
