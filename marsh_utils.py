@@ -2467,7 +2467,135 @@ def ensure_all_classes_in_m1(polygons_m1, m1_bounds, geom, rng):
         )
     return polygons_m1
 
+def fill_missing_classes(polygons_gdf, geom, bounds, rng,
+                         min_per_class=3, verbose=True):
+    """Add synthetic polygons for any classes that are missing or sparse.
+    
+    For bank classes (healthy_bank, eroding, crab_*, collapsed), places polygons
+    along channels. For 'other', places them in marsh interior. Skips classes
+    that already have >= min_per_class polygons.
+    
+    Args:
+        polygons_gdf: existing labeled GeoDataFrame with 'Class' column
+        geom: marsh geometry dict (needs 'all_water', 'all_banks',
+              'main_channel', 'tributaries')
+        bounds: spatial bounds (shapely box)
+        rng: numpy random generator
+        min_per_class: minimum polygons each class should have
+        verbose: print what gets added
+    
+    Returns: augmented GeoDataFrame (original + new synthetic polygons).
+    """
+    from shapely.geometry import Polygon
+    
+    existing_counts = (polygons_gdf['Class'].value_counts().to_dict()
+                       if len(polygons_gdf) > 0 else {})
+    
+    additions = []
+    bank_class_names = {'healthy_bank', 'eroding_non_crab',
+                        'crab_edge', 'crab_platform', 'collapsed'}
+    
+    for class_name, qgis_val in CLASSES.items():
+        current  = existing_counts.get(qgis_val, 0)
+        n_needed = max(0, min_per_class - current)
+        if n_needed == 0:
+            continue
+        if verbose:
+            print(f"  Class '{class_name}' (QGIS={qgis_val}): "
+                  f"{current} existing, adding {n_needed}")
+        
+        if class_name == 'other':
+            additions.extend(_make_interior_polygons(
+                geom, bounds, rng, n_needed, qgis_val))
+        elif class_name in bank_class_names:
+            additions.extend(_make_bank_polygons(
+                geom, rng, n_needed, qgis_val))
+    
+    if not additions:
+        return polygons_gdf
+    
+    new_polys = gpd.GeoDataFrame(additions, geometry='geometry', crs=CRS)
+    out = gpd.GeoDataFrame(
+        pd.concat([polygons_gdf, new_polys], ignore_index=True),
+        crs=polygons_gdf.crs or CRS,
+    )
+    return out
 
+
+def _make_bank_polygons(geom, rng, n, class_qgis):
+    """Create n small irregular polygons near channel banks."""
+    from shapely.geometry import Polygon
+    all_channels = [geom['main_channel']] + list(geom['tributaries'])
+    rows, attempts = [], 0
+    while len(rows) < n and attempts < 200:
+        attempts += 1
+        channel = all_channels[rng.integers(0, len(all_channels))]
+        if channel.length < 2:
+            continue
+        # Random point along channel, then perpendicular offset for bank
+        t = rng.uniform(0.1, 0.9)
+        center = channel.interpolate(t, normalized=True)
+        offset_dist  = rng.uniform(1.0, 3.0)
+        offset_angle = rng.choice([-1, 1]) * (np.pi/2 + rng.uniform(-0.3, 0.3))
+        cx = center.x + offset_dist * np.cos(offset_angle)
+        cy = center.y + offset_dist * np.sin(offset_angle)
+        # Small irregular polygon
+        r = rng.uniform(0.6, 1.5)
+        pts = [(cx + r*rng.uniform(0.7, 1.3)*np.cos(theta),
+                cy + r*rng.uniform(0.7, 1.3)*np.sin(theta))
+               for theta in np.linspace(0, 2*np.pi, 10, endpoint=False)]
+        poly = Polygon(pts)
+        if poly.intersects(geom['all_water']):
+            continue
+        rows.append({'Class': class_qgis, 'geometry': poly})
+    return rows
+
+
+def _make_interior_polygons(geom, bounds, rng, n, class_qgis):
+    """Create n polygons in marsh interior (away from water and banks)."""
+    from shapely.geometry import Polygon
+    xmin, ymin, xmax, ymax = bounds.bounds
+    extent_x, extent_y = xmax - xmin, ymax - ymin
+    rows, attempts = [], 0
+    while len(rows) < n and attempts < 200:
+        attempts += 1
+        cx = rng.uniform(xmin + 0.15*extent_x, xmax - 0.15*extent_x)
+        cy = rng.uniform(ymin + 0.20*extent_y, ymax - 0.15*extent_y)
+        r = rng.uniform(0.8, 2.0)
+        pts = [(cx + r*rng.uniform(0.7, 1.3)*np.cos(theta),
+                cy + r*rng.uniform(0.7, 1.3)*np.sin(theta))
+               for theta in np.linspace(0, 2*np.pi, 10, endpoint=False)]
+        poly = Polygon(pts)
+        if poly.intersects(geom['all_water']) or poly.intersects(geom['all_banks']):
+            continue
+        rows.append({'Class': class_qgis, 'geometry': poly})
+    return rows
+
+# Add to marsh_utils.py — wraps fill_missing_classes with channel_centerlines input
+def fill_missing_classes_from_centerlines(polygons_gdf, bounds, channel_centerlines, rng,
+                                           min_per_class=3, verbose=True,
+                                           water_buffer_m=2.0, bank_buffer_m=5.0):
+    """Wrapper around fill_missing_classes for use when only channel_centerlines
+    are available (e.g., in the M2 training notebook in synthetic mode).
+    
+    Reconstructs a minimal geom dict from the centerlines + buffer widths.
+    """
+    from shapely.ops import unary_union
+    channels = list(channel_centerlines.geometry)
+    if not channels:
+        if verbose:
+            print("  No channels in centerlines — skipping bank-class fill.")
+        return polygons_gdf
+    all_water = unary_union([c.buffer(water_buffer_m) for c in channels])
+    all_banks = unary_union([c.buffer(bank_buffer_m) for c in channels]).difference(all_water)
+    geom = {
+        'main_channel': channels[0],
+        'tributaries':  channels[1:],
+        'all_water':    all_water,
+        'all_banks':    all_banks,
+    }
+    return fill_missing_classes(polygons_gdf, geom, bounds, rng,
+                                 min_per_class=min_per_class, verbose=verbose)
 # ============================================================================
 # Raster rendering
 # ============================================================================
