@@ -2313,7 +2313,47 @@ def generate_other_handlabels(geom, bounds, rng,
         placed += 1
     
     return gpd.GeoDataFrame(rows, geometry='geometry', crs=CRS)
-
+def fill_missing_classes_from_channel_mask(polygons_gdf, bounds, channel_mask_path, rng,
+                                            min_per_class=3, bank_buffer_m=4.0,
+                                            verbose=True):
+    """Like fill_missing_classes but derives water and banks from a channel_mask raster.
+    
+    More reliable than the centerlines variant — uses the actual water footprint
+    from the rasterized mask rather than reconstructing it via buffer assumptions.
+    """
+    import rasterio
+    from rasterio.features import shapes
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+    
+    with rasterio.open(channel_mask_path) as src:
+        mask = src.read(1).astype(np.uint8)
+        transform = src.transform
+    
+    water_polys = [shape(g) for g, v in shapes(mask, mask=mask.astype(bool),
+                                                transform=transform) if v == 1]
+    if not water_polys:
+        if verbose:
+            print("  No water in mask — skipping bank-class fill.")
+        return polygons_gdf
+    
+    all_water = unary_union(water_polys)
+    all_banks = all_water.buffer(bank_buffer_m).difference(all_water)
+    
+    # For bank placement, use the boundary of the water polygon
+    boundary = all_water.boundary
+    channels = list(boundary.geoms) if hasattr(boundary, 'geoms') else [boundary]
+    
+    geom = {
+        'main_channel': channels[0] if channels else None,
+        'tributaries':  channels[1:],
+        'all_water':    all_water,
+        'all_banks':    all_banks,
+    }
+    
+    return fill_missing_classes(polygons_gdf, geom, bounds, rng,
+                                 min_per_class=min_per_class, verbose=verbose)
+                                              
 # ============================================================================
 # Polygon label assignment
 # ============================================================================
