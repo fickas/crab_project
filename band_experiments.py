@@ -34,66 +34,39 @@ def run_band_experiment(
     experiment_name,
     band_spec,
     base_paths,
-    polygons_gdf,
+    train_patches,
+    val_patches,
+    test_patches,
     config_class,
     output_dir_root,
     setup_steps=None,
     device='cuda',
     force=False,
 ):
-    """
-    Train one model with the given BAND_SPEC and record results.
-
-    Args:
-        experiment_name: directory-safe name (e.g. 'pan_ndvi_savi')
-        band_spec: list of (raster_key, band_num) tuples
-        base_paths: starting paths dict (will be copied + augmented)
-        polygons_gdf: labels GeoDataFrame
-        config_class: the Config class — its BAND_SPEC gets overridden
-        output_dir_root: parent directory for all experiments
-        setup_steps: list of (ensure_function_name, kwargs) tuples to run
-                     before building patches, e.g.
-                     [('ensure_slope', {'dem_key': 'dem_high_res',
-                                        'smooth_sigma_m': 0.05})]
-        force: re-run even if summary.json exists
-
-    Returns: the summary dict (also written to summary.json)
-    """
     exp_dir = os.path.join(output_dir_root, experiment_name)
     summary_path = os.path.join(exp_dir, 'summary.json')
-
+    
     if not force and os.path.exists(summary_path):
         print(f"[{experiment_name}] already complete, loading cached summary")
         with open(summary_path) as f:
             return json.load(f)
-
+    
     os.makedirs(exp_dir, exist_ok=True)
     print(f"\n{'='*70}\n[{experiment_name}]\n  bands: {[b[0] for b in band_spec]}\n{'='*70}")
     t_start = time.time()
-
+    
     # ── 1. Override Config and ensure derived bands exist ──
     config_class.BAND_SPEC = band_spec
     paths = dict(base_paths)
     for step_name, step_kwargs in (setup_steps or []):
-        ensure_fn = getattr(mu, step_name)
-        ensure_fn(paths, **step_kwargs)
-
-    # ── 2. Build patches (with new BAND_SPEC) ──
-    patches = list(mu.build_patches_with_splits_multi(
-        paths=paths,
-        polygons_gdf=polygons_gdf,
-        cfg=config_class,
-    ))
-    train_patches = [p for p in patches if p.get('split') == 'train']
-    val_patches   = [p for p in patches if p.get('split') == 'val']
-    test_patches  = [p for p in patches if p.get('split') == 'test']
-    print(f"  patches: train={len(train_patches)}, val={len(val_patches)}, test={len(test_patches)}")
-
-    # ── 3. Normalization stats ──
+        getattr(mu, step_name)(paths, **step_kwargs)
+    
+    # ── 2. Patches are pre-built — skipping ──
+    print(f"  patches (reused): train={len(train_patches)}, val={len(val_patches)}, test={len(test_patches)}")
+    
+    # ── 3. Normalization stats (band-specific) ──
     stats_path = os.path.join(exp_dir, 'channel_stats.json')
-    channel_means, channel_stds = mu.compute_channel_stats(
-        train_patches, stats_path
-    )
+    channel_means, channel_stds = mu.compute_channel_stats(train_patches, stats_path)
 
     # ── 4. Datasets & loaders ──
     train_ds = mu.MarshSegmentationDataset(train_patches, augmentation=mu.get_augmentations('train', channel_means, channel_stds))
@@ -179,26 +152,44 @@ def run_band_experiment(
 # ─────────────────────────────────────────────────────────────────────────────
 # Run many experiments, update CSV
 # ─────────────────────────────────────────────────────────────────────────────
-def run_band_experiments(
-    experiments, base_paths, polygons_gdf, config_class,
-    output_dir_root, device='cuda', force=False,
-):
-    """
-    Run a list of experiments and write a summary CSV.
-
-    experiments: list of dicts, each with keys:
-        'name'        — experiment name (becomes subdirectory)
-        'band_spec'   — list of (raster_key, band_num) tuples
-        'setup'       — optional list of (ensure_fn_name, kwargs) to run first
-    """
+def run_band_experiments(experiments, base_paths, polygons_gdf, config_class,
+                         output_dir_root, device='cuda', force=False):
     os.makedirs(output_dir_root, exist_ok=True)
+    
+    # ── Build patches ONCE — splits don't depend on BAND_SPEC ──
+    # Patches are spatial windows tagged with train/val/test; they don't
+    # care which bands the model uses, only the spatial layout.
+    print(f"Building patches (one-time, shared across all experiments)...")
+    
+    # Set BAND_SPEC to a minimal one for the patch build — this is just to
+    # satisfy whatever the build function expects. Any spec works since
+    # patches are spatial.
+    config_class.BAND_SPEC = experiments[0]['band_spec']
+    
+    # Run setup steps from the FIRST experiment so any derived bands the
+    # patch builder might check are present.
+    paths = dict(base_paths)
+    for step_name, step_kwargs in (experiments[0].get('setup') or []):
+        getattr(mu, step_name)(paths, **step_kwargs)
+    
+    patches = list(mu.build_patches_with_splits_multi(
+        paths=paths, polygons_gdf=polygons_gdf, cfg=config_class,
+    ))
+    train_patches = [p for p in patches if p.get('split') == 'train']
+    val_patches   = [p for p in patches if p.get('split') == 'val']
+    test_patches  = [p for p in patches if p.get('split') == 'test']
+    print(f"  Patches: train={len(train_patches)}, val={len(val_patches)}, test={len(test_patches)}\n")
+    
+    # ── Run each experiment with pre-built patches ──
     summaries = []
     for exp in experiments:
         s = run_band_experiment(
             experiment_name=exp['name'],
             band_spec=exp['band_spec'],
             base_paths=base_paths,
-            polygons_gdf=polygons_gdf,
+            train_patches=train_patches,
+            val_patches=val_patches,
+            test_patches=test_patches,
             config_class=config_class,
             output_dir_root=output_dir_root,
             setup_steps=exp.get('setup'),
@@ -206,6 +197,8 @@ def run_band_experiments(
             force=force,
         )
         summaries.append(s)
+    
+    # ... existing CSV building ...
 
     # Build comparison CSV
     rows = []
