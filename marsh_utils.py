@@ -1969,6 +1969,41 @@ def predict_full_raster(
         print(f"Wrote predictions: {output_path}")
         print(f"  shape: {probs_final.shape}  classes: {list(cfg.CLASS_NAMES.values())}")
 
+import rasterio
+
+def check_alignment(reference_path, *other_paths, precision=1e-6, verbose=True):
+    """Check that rasters share CRS, transform, and shape with a reference.
+
+    Pixel-for-pixel intersection (abstain raster x superpixel raster) is only
+    valid when all three match. Returns True iff every other raster aligns with
+    the reference; prints a per-raster report when verbose.
+    """
+    def grid_of(path):
+        with rasterio.open(path) as src:
+            return src.crs, src.transform, (src.height, src.width)
+
+    ref_crs, ref_tf, ref_shape = grid_of(reference_path)
+    if verbose:
+        print(f"reference: {reference_path}")
+        print(f"  crs={ref_crs.to_string() if ref_crs else None}  "
+              f"size={ref_shape[1]}x{ref_shape[0]}  px=({ref_tf.a:g},{ref_tf.e:g})  "
+              f"origin=({ref_tf.c:g},{ref_tf.f:g})")
+
+    all_ok = True
+    for p in other_paths:
+        crs, tf, shape = grid_of(p)
+        crs_ok, tf_ok, shape_ok = (crs == ref_crs), tf.almost_equals(ref_tf, precision=precision), (shape == ref_shape)
+        ok = crs_ok and tf_ok and shape_ok
+        all_ok = all_ok and ok
+        if verbose:
+            print(f"  [{'OK' if ok else 'XX'}] {p}")
+            if not crs_ok:   print(f"        crs differs: {crs.to_string() if crs else None}")
+            if not shape_ok: print(f"        size differs: {shape[1]}x{shape[0]} vs ref {ref_shape[1]}x{ref_shape[0]}")
+            if not tf_ok:    print(f"        grid differs: px=({tf.a:g},{tf.e:g}) origin=({tf.c:g},{tf.f:g})")
+    if verbose:
+        print("ALIGNED" if all_ok else "NOT ALIGNED -- fix before intersecting")
+    return all_ok
+  
 """
 abstain.py -- build the per-pixel "abstain bucket" from a cached softmax raster.
 
