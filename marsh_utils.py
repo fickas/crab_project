@@ -1969,6 +1969,133 @@ def predict_full_raster(
         print(f"Wrote predictions: {output_path}")
         print(f"  shape: {probs_final.shape}  classes: {list(cfg.CLASS_NAMES.values())}")
 
+"""
+abstain.py -- build the per-pixel "abstain bucket" from a cached softmax raster.
+
+Lives in the Model 1 production stage, but derived from the CACHED softmax (the
+same artifact the decision rules use) rather than welded into inference -- so the
+abstain thresholds can be re-tuned with a cheap CPU pass, no model re-run.
+
+For each valid pixel it looks at the top-2 class probabilities:
+  margin = P1 - P2
+  abstain      when margin < min_margin
+    -> pair    when the top-2 hold most of the mass (P1 + P2 >= mass_cutoff):
+               a genuine two-way tie; record WHICH two classes.
+    -> diffuse otherwise: the mass is smeared across many classes.
+
+Output: a single-band uint8 GeoTIFF aligned to the softmax raster, where
+  0          = not abstain (confident) or outside footprint
+  1..15      = abstain-pair, encoding the unordered contested class pair
+  100        = abstain-diffuse
+plus a JSON legend mapping each code to its class-pair names.
+
+Requires: rasterio, numpy.
+"""
+
+import os
+import json
+import itertools
+import numpy as np
+import rasterio
+
+DIFFUSE_CODE = 100
+
+DEFAULT_CLASS_NAMES = [
+    "other", "healthy_bank", "eroding_non_crab",
+    "crab_edge", "crab_platform", "collapsed",
+]
+
+
+def _pair_codes(n_classes):
+    """Map each unordered class pair to a small integer code (1..C(n,2))."""
+    pairs = list(itertools.combinations(range(n_classes), 2))
+    return {pair: k + 1 for k, pair in enumerate(pairs)}, pairs
+
+
+def build_abstain_raster(
+    softmax_path,
+    out_path,
+    min_margin=0.15,
+    mass_cutoff=0.80,
+    class_names=None,
+    require_classes=None,    # only flag pairs that involve one of these class indices
+    write_legend=True,
+):
+    """Derive a per-pixel abstain-code raster from a cached softmax GeoTIFF.
+
+    softmax_path : multi-band float GeoTIFF, one band per class, per-pixel
+                   probabilities (need not be perfectly normalized). Nodata /
+                   outside-footprint pixels should read as all-zero or non-finite.
+    out_path     : single-band uint8 abstain-code raster to write.
+    min_margin   : abstain when (P1 - P2) < this.
+    mass_cutoff  : among abstains, pair-case when (P1 + P2) >= this, else diffuse.
+    require_classes : optional iterable of class indices; if given, only pairs that
+                   include one of these get a code (others -> 0). e.g. restrict to
+                   the damage classes so you don't queue irrelevant ties.
+
+    Returns (out_path, stats_dict) where stats_dict maps a label -> pixel count.
+    """
+    with rasterio.open(softmax_path) as src:
+        sm = src.read().astype(np.float32)          # (C, H, W)
+        profile = src.profile.copy()
+    sm = np.transpose(sm, (1, 2, 0))                # (H, W, C)
+    C = sm.shape[-1]
+    if class_names is None:
+        class_names = DEFAULT_CLASS_NAMES[:C] if C <= len(DEFAULT_CLASS_NAMES) \
+            else [f"class_{k}" for k in range(C)]
+
+    valid = np.isfinite(sm).all(axis=-1) & (sm.sum(axis=-1) > 0.5)
+
+    order = np.argsort(-sm, axis=-1)                # descending
+    i = order[..., 0]
+    j = order[..., 1]
+    P1 = np.take_along_axis(sm, i[..., None], axis=-1)[..., 0]
+    P2 = np.take_along_axis(sm, j[..., None], axis=-1)[..., 0]
+
+    margin = P1 - P2
+    mass = P1 + P2
+    abstain = valid & (margin < min_margin)
+    pair_case = abstain & (mass >= mass_cutoff)
+    diffuse_case = abstain & ~pair_case
+
+    code_of, pairs = _pair_codes(C)
+    code_map = np.zeros((C, C), dtype=np.uint8)
+    for (a, b), k in code_of.items():
+        code_map[a, b] = k
+    lo = np.minimum(i, j)
+    hi = np.maximum(i, j)
+    pair_code = code_map[lo, hi]
+
+    out = np.zeros(sm.shape[:2], dtype=np.uint8)
+    out[pair_case] = pair_code[pair_case]
+    out[diffuse_case] = DIFFUSE_CODE
+
+    if require_classes is not None:
+        req = set(int(c) for c in require_classes)
+        for (a, b), k in code_of.items():
+            if a not in req and b not in req:
+                out[out == k] = 0
+
+    profile.update(count=1, dtype="uint8", nodata=0, compress="lzw")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(out, 1)
+        dst.set_band_description(1, "abstain_code")
+
+    legend = {str(k): [class_names[a], class_names[b]] for (a, b), k in code_of.items()}
+    legend[str(DIFFUSE_CODE)] = ["diffuse", "diffuse"]
+    if write_legend:
+        with open(os.path.splitext(out_path)[0] + "_legend.json", "w") as f:
+            json.dump(legend, f, indent=2)
+
+    # stats: how many pixels per code (the diagnostic -- e.g. healthy|crab share)
+    stats = {}
+    present, counts = np.unique(out[out > 0], return_counts=True)
+    for code, n in zip(present.tolist(), counts.tolist()):
+        label = "diffuse" if code == DIFFUSE_CODE else "|".join(legend[str(code)])
+        stats[label] = n
+    return out_path, stats
+  
 def predictions_to_polygons(
     prob_raster_path,
     cfg,
