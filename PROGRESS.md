@@ -1,6 +1,6 @@
 # Crab Burrow Segmentation — Progress Report
 
-## Stephen Fickas, June 2026
+## Stephen Fickas, June 2026 (updated June 15)
 
 ## Project Overview
 
