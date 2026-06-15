@@ -2046,6 +2046,143 @@ def _pair_codes(n_classes):
     pairs = list(itertools.combinations(range(n_classes), 2))
     return {pair: k + 1 for k, pair in enumerate(pairs)}, pairs
 
+"""
+abstain_review.py -- intersect the abstain bucket with the superpixel containers
+and promote high-abstain containers into a tagged review layer for QGIS.
+
+For every container (superpixel id > 0) it computes, from the per-pixel abstain
+codes:
+  n_pixels      container size
+  n_pair        pixels flagged as a two-way tie (codes 1..15)
+  n_diffuse     pixels flagged diffuse (code 100)
+  abstain_frac  n_pair / n_pixels         <- the promotion metric
+  contested_pair  the container's DOMINANT pair (mode over its pair pixels)
+  pair_purity   share of pair pixels that are the dominant pair (low => mixed)
+
+Promotion is driven by PAIR abstentions only (diffuse is tracked but does not
+promote -- pairs are the high-yield labeling target, diffuse is a diagnostic).
+Output: a GeoPackage of promoted container polygons, one labelable unit each,
+tagged with the contested pair and sorted into a work queue.
+
+Requires: rasterio, numpy, geopandas, shapely.
+"""
+
+import os
+import json
+import numpy as np
+import rasterio
+from rasterio.features import shapes
+from shapely.geometry import shape
+import geopandas as gpd
+
+_SCHEMA = ["container_id", "n_pixels", "n_pair", "n_diffuse",
+           "abstain_frac", "diffuse_frac", "pair_purity",
+           "pair_code", "contested_pair"]
+
+
+def build_abstain_review_polygons(
+    superpixel_path,
+    abstain_path,
+    out_gpkg,
+    min_abstain_frac=0.30,
+    min_pair_pixels=0,
+    legend_path=None,
+    layer="abstain_review",
+):
+    """Promote high-abstain containers to a tagged review GeoPackage.
+
+    min_abstain_frac : promote a container when its pair-abstain fraction >= this.
+    min_pair_pixels  : also require at least this many pair pixels (guards tiny
+                       containers tripping the fraction on a couple of pixels).
+    legend_path      : pair-code -> [classA, classB] JSON; defaults to the
+                       '<abstain>_legend.json' written by build_abstain_raster.
+
+    Returns the GeoDataFrame (also written to out_gpkg). Empty if none promoted.
+    """
+    if legend_path is None:
+        legend_path = os.path.splitext(abstain_path)[0] + "_legend.json"
+    legend = json.load(open(legend_path)) if os.path.exists(legend_path) else {}
+
+    with rasterio.open(superpixel_path) as ssrc:
+        seg = ssrc.read(1).astype(np.int64)
+        crs, transform = ssrc.crs, ssrc.transform
+        sshape = (ssrc.height, ssrc.width)
+    with rasterio.open(abstain_path) as asrc:
+        ab = asrc.read(1)
+        ashape = (asrc.height, asrc.width)
+    if sshape != ashape:
+        raise ValueError(f"grid mismatch: superpixels {sshape} vs abstain {ashape}")
+
+    n_ids = int(seg.max())
+    if n_ids == 0:
+        return _empty(crs)
+
+    valid = seg > 0
+    size = np.bincount(seg[valid].ravel(), minlength=n_ids + 1)
+
+    is_pair = (ab >= 1) & (ab <= 15) & valid
+    is_diffuse = (ab == 100) & valid
+    pair_count = np.bincount(seg[is_pair].ravel(), minlength=n_ids + 1)
+    diffuse_count = np.bincount(seg[is_diffuse].ravel(), minlength=n_ids + 1)
+
+    # Dominant pair code per container via a (container_id, code) histogram.
+    cid = seg[is_pair].ravel()
+    code = ab[is_pair].ravel().astype(np.int64)
+    hist = np.bincount(cid * 16 + code,
+                       minlength=(n_ids + 1) * 16).reshape(n_ids + 1, 16)
+    dom_code = hist.argmax(axis=1)
+    dom_count = hist.max(axis=1)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        abstain_frac = np.where(size > 0, pair_count / size, 0.0)
+        diffuse_frac = np.where(size > 0, diffuse_count / size, 0.0)
+        pair_purity = np.where(pair_count > 0, dom_count / pair_count, 0.0)
+
+    promote = (abstain_frac >= min_abstain_frac) & (pair_count >= max(1, min_pair_pixels))
+    if not promote[1:].any():
+        print(f"no containers promoted at min_abstain_frac={min_abstain_frac}")
+        return _empty(crs)
+
+    promoted_mask = promote[seg]                 # per-pixel; promote[0] is False
+    seg_i32 = seg.astype(np.int32)
+
+    feats = []
+    for geom, cid_f in shapes(seg_i32, mask=promoted_mask,
+                              transform=transform, connectivity=4):
+        c = int(cid_f)
+        if c == 0:
+            continue
+        dc = int(dom_code[c])
+        names = [n for n in legend.get(str(dc), [f"code_{dc}"]) if n]
+        feats.append({
+            "container_id": c,
+            "n_pixels": int(size[c]),
+            "n_pair": int(pair_count[c]),
+            "n_diffuse": int(diffuse_count[c]),
+            "abstain_frac": round(float(abstain_frac[c]), 3),
+            "diffuse_frac": round(float(diffuse_frac[c]), 3),
+            "pair_purity": round(float(pair_purity[c]), 3),
+            "pair_code": dc,
+            "contested_pair": "|".join(names),
+            "geometry": shape(geom),
+        })
+
+    gdf = gpd.GeoDataFrame(feats, crs=crs)
+    gdf = gdf.sort_values(["contested_pair", "abstain_frac"],
+                          ascending=[True, False]).reset_index(drop=True)
+
+    if os.path.exists(out_gpkg):
+        os.remove(out_gpkg)
+    os.makedirs(os.path.dirname(out_gpkg) or ".", exist_ok=True)
+    gdf.to_file(out_gpkg, layer=layer, driver="GPKG")
+
+    print(f"promoted {gdf['container_id'].nunique()} containers -> {out_gpkg}")
+    print(gdf.groupby("contested_pair")["abstain_frac"].agg(["count", "mean"]).round(3))
+    return gdf
+
+
+def _empty(crs):
+    return gpd.GeoDataFrame(columns=_SCHEMA, geometry=[], crs=crs)
 
 def build_abstain_raster(
     softmax_path,
