@@ -193,9 +193,9 @@ The output is a dictionary like `{3: 0.62, 4: 0.55, 5: 0.71}` — meaning a pixe
 End-to-end inference for deployment on new flights:
 
 - Tile imagery into patches matching training configuration
-- Run U-Net inference with the trained model
+- Run U-Net inference with the trained model, writing a per-pixel softmax raster (one float band per class) via Gaussian-weighted patch blending — this cached softmax is the single source artifact for the decision rules and the abstain bucket (section 8), so thresholds can be re-tuned without re-running the model
 - Apply per-class confidence thresholds calibrated on validation set
-- Polygonize predicted masks per class
+- Polygonize predicted masks per class (now with optional exclusion of abstain-bucket pixels — see section 8 — so the confident map and the review queue partition cleanly)
 - Filter polygons by area and confidence
 - Output GeoPackage / Shapefile compatible with QGIS for review
 
@@ -243,13 +243,57 @@ Each rule operates on cached softmax outputs, so threshold and rule sweeps run i
 - Pixel B: model is hedging between `healthy_bank` and `crab_edge` — this is exactly the failure mode we see in confusion matrices. `margin_abstain(min_margin=0.15)` flags this as uncertain and abstains
 - Pixel C: model has no idea — entropy-abstain catches this case more naturally
 
-The point of `margin_abstain` over `argmax_abstain` is that it specifically detects *two-way ties* — and we can report which two classes were tied. If 80% of abstentions are `(healthy_bank, crab_edge)` pairs, we've found a specific actionable problem (these two classes need better discrimination) rather than a generic uncertainty issue.
+The point of `margin_abstain` over `argmax_abstain` is that it specifically detects *two-way ties* — and we can report which two classes were tied. If 80% of abstentions are `(healthy_bank, crab_edge)` pairs, we've found a specific actionable problem (these two classes need better discrimination) rather than a generic uncertainty issue. This pair-reporting is what the active-learning loop (section 8) is built on.
+
+### 8. Active-Learning Labeling Loop
+
+The original plan for real data was exhaustive QGIS hand-labeling of crab polygons over the 1 cm imagery. That doesn't scale: a real marsh is hundreds of meters across, and most of it is unambiguous (open water, healthy interior) that the model already gets right. Hand-labeling all of it spends the expert's time where it adds no information.
+
+Instead, we now close an *active-learning* loop. Train Model 1, run it over the full raster, and use the model's own uncertainty to point the labeler at exactly the regions where a new label would teach it the most. The expert labels only those regions; the labels feed back into training; repeat. This is a well-established paradigm — superpixel-based active learning for semantic segmentation (Cai et al., CVPR 2021; Kim et al., ICCV 2023), with a long lineage in remote sensing (e.g. Tuia and colleagues on superpixel-based active learning for land cover). The one local twist is that we tag each review region with the *contested class pair* the model is torn between, which turns the queue into a set of specific, answerable two-way questions rather than a generic "uncertain" mask.
+
+**The loop, end to end:**
+
+1. **Cache the softmax.** Model 1 production already writes a per-pixel softmax raster (one float band per class) rather than hard labels. This is the single source artifact, and because it is cached, the abstain thresholds below are re-tunable with cheap CPU passes — no model re-run.
+
+2. **Build the abstain bucket.** `build_abstain_raster` derives, from the cached softmax, a per-pixel `uint8` raster of *contested-pair codes*. For each pixel it takes the top-2 margin; where the margin is below `min_margin` it flags the pixel as either a *pair* (a specific two-way tie, codes 1–15, recording which two classes) when the top-2 hold most of the probability mass, or *diffuse* (code 100) when the mass is smeared across many classes. A JSON legend decodes the pair codes to class names, and `require_classes` scopes the flagging to ties involving the classes we care about.
+
+3. **Partition the prediction.** `predictions_to_polygons` now optionally takes the abstain raster and *excludes* its flagged pixels from the confident per-class output. The result is a clean split governed by a single margin threshold: confident pixels become the prediction map (the deliverable), uncertain pixels become the review queue, and every pixel lands in exactly one bucket.
+
+4. **Build superpixel containers.** Per-pixel uncertainty cannot be labeled by hand — it is thousands of scattered pixels. So we segment the imagery into *superpixels* (SLIC) — appearance-homogeneous pixel clumps that respect real edges — computed from a small curated band set: pan for structure, NDVI for the vegetation/damage axis, and a geomorphic band such as `tpi_small` for the spectrally-subtle crab/healthy edge. A per-band weighting lets the geomorphic band lead when busy pan texture would otherwise dominate the clustering. Superpixels are model-independent and built once per flight; their boundaries are also exported as a GeoPackage (with a QGIS style sidecar) for overlay on the ortho.
+
+5. **Promote review polygons.** `build_abstain_review_polygons` intersects the abstain raster with the superpixel containers. For each container it computes the fraction of pair-abstain pixels and the dominant contested pair, then promotes containers above an abstain-fraction threshold into a GeoPackage review layer — one labelable unit each, tagged with its contested pair, abstain fraction, and pair purity, and sorted into a work queue.
+
+6. **Label and retrain.** The expert opens the review layer in QGIS over the imagery (categorized by contested pair) and, for each container, answers the question the model framed — which of the two classes is this? — assigning the class, or splitting the container where it straddles a real boundary. Because we label open-world, these are simply additional labeled regions added to the sparse set; everything unlabeled stays ignore. The labels rasterize into Model 1 supervision, the model retrains, and the next production pass yields a smaller, sharper abstain bucket. The loop turns.
+
+**Design decisions worth recording.**
+
+- *Margin is the abstain rule, not a free choice.* The review queue depends on knowing *which two* classes are tied — the contested pair — and margin (top-1 minus top-2) is the only standard acquisition rule that yields a clean pair. `argmax_abstain` and `entropy_abstain` detect uncertainty but not a pair; `priority` and `soft_cascade` are prediction rules. So the abstain bucket is tuned via `min_margin`, not by swapping rules.
+- *Pairs drive promotion; diffuse is set aside.* Pair abstentions are answerable two-way questions and make high-yield labels. Diffuse abstentions are usually genuinely low-signal pixels, or a signal about data problems or a missing class. They are tracked (`diffuse_frac`) but do not promote, though they remain a diagnostic to mine later.
+- *Uniform container size is deliberate.* SLIC partitions into a roughly fixed number of equal-size containers and never merges adjacent ones, so a uniform stretch of water is carved into many same-size tiles. That is desirable here: the redundant water containers cost nothing (near-zero abstain fraction, never promoted), and a roughly constant container size keeps the abstain *fraction* meaning the same thing everywhere — a small crab cluster lands in its own container where it can trip the threshold, rather than being diluted inside a giant merged region.
+- *Heterogeneity is handled, not eliminated.* A container can straddle a class boundary (low `pair_purity`). This is managed by appearance-homogeneous containers (small enough that most are pure), the contested-pair tag (which bounds the heterogeneity to two classes), the human split in QGIS, and optionally an automatic sieving step (excluding confidently-disagreeing pixels from the loss, in the spirit of Kim et al.) for gross spillover.
+
+**Components added.**
+
+- Superpixel builder (`build_superpixels`, `build_superpixels_from_bands`, `ensure_superpixels_from_bands`) — SLIC over a curated, optionally weighted band set; writes a `uint32` superpixel-ID GeoTIFF. Plus `write_boundaries_gpkg` for the QGIS overlay layer (no-fill outlines, `DN` = superpixel id) with a `.qml` style sidecar.
+- Abstain-bucket builder (`build_abstain_raster`) — margin-based contested-pair codes plus diffuse, JSON legend, `require_classes` scoping.
+- Partition edit to `predictions_to_polygons` — optional `abstain_raster_path` that withholds flagged pixels from the confident map.
+- Review-polygon builder (`build_abstain_review_polygons`) — container aggregation, abstain-fraction promotion, contested-pair tagging, work-queue GeoPackage.
+- Alignment checker (`check_alignment`) — verifies the softmax, abstain, and superpixel rasters share CRS, transform, and shape before any intersection.
+
+**Parameters to set on real data.** The synthetic values are placeholders; the following are set once real results can be seen, roughly in this order:
+
+- Superpixel `weights`, `compactness`, `target_superpixel_px` — set from the boundary overlay (on the geomorphic band, not just pan) before any labeling; raise the geomorphic weight until containers follow real burrow texture.
+- `min_margin` and `mass_cutoff` (abstain bucket) and the per-class `CONFIDENCE_THRESHOLDS` (recomputed from scratch via `pick_thresholds` on a real validation set) — follow the first round of real labeling and the real confusion matrix.
+- `min_abstain_frac` (promotion) — set against the labeling budget and the real distribution of container abstain fractions.
+- `require_classes` — set from which confusions actually occur on real data (see the tie-diagnostics discussion below).
+
+The pipeline architecture, the use of margin for the abstain bucket, and the class scheme itself are *not* data-tuned knobs and should not be revisited as part of this parameter sweep.
 
 ## Preliminary Findings (Synthetic Data)
 
 The synthetic-data confusion matrices revealed several insights ahead of real-data flights. Given both the speculative class breakout and the synthetic nature of this data, I would use this more as a guide to the kinds of things we may find in our final results.
 
-1. **The dominant failure mode is intra-bank confusion**, specifically `crab_edge` getting predicted as `healthy_bank`. Roughly half of true `crab_edge` pixels go to `healthy_bank` under argmax. This is the discrimination that matters most ecologically and is the right target for further work.
+1. **The dominant failure mode is intra-bank confusion**, specifically `crab_edge` getting predicted as `healthy_bank`. Roughly half of true `crab_edge` pixels go to `healthy_bank` under argmax. This is the discrimination that matters most ecologically and is the right target for further work. (Note: this finding is from the early `pan + NDVI + NDRE` baseline; on the latest model the synthetic confusion has largely closed — see the update at the end of this section.)
 
 2. **A two-stage (binary then fine-grained) cascade approach probably wouldn't help.** The confusion is between two bank classes, not bank-vs-not-bank. A first-stage "is it a bank" model would correctly route both confused classes to the second stage; the hard problem is the fine-grained discrimination within bank classes.
 
@@ -259,7 +303,7 @@ The synthetic-data confusion matrices revealed several insights ahead of real-da
 
 5. **Synthetic results are not directly predictive of real-data results**, because synthetic data lacks the spectral and textural complexity of real marsh imagery. The infrastructure is validated; the band rankings will be revisited on real data.
 
-**Concrete numbers from the most recent synthetic run** (baseline `pan + NDVI + NDRE`, validation set, recall normalization):
+**Concrete numbers from an early synthetic run** (baseline `pan + NDVI + NDRE`, validation set, recall normalization):
 
 | True class | Predicted (top-2 destinations) | Recall on diagonal |
 |---|---|---|
@@ -267,18 +311,41 @@ The synthetic-data confusion matrices revealed several insights ahead of real-da
 | crab_edge | → healthy_bank (44%), crab_edge (49%) | 0.49 (the failure mode) |
 | crab_platform | → crab_platform (96%), eroding (3%) | 0.96 (clean) |
 
-The `crab_edge` → `healthy_bank` confusion (44% of true crab_edge pixels misclassified) is the dominant signal. `crab_platform` and `healthy_bank` are well-separated, so the network has the capacity to discriminate when the spectral / spatial difference is large enough — `crab_edge` is the regime where the synthetic signal isn't sharp enough. Real data will likely have more pronounced texture and roughness differences at burrow edges, which is why DEM-derived bands are the natural next thing to test.
+The `crab_edge` → `healthy_bank` confusion (44% of true crab_edge pixels misclassified) was the dominant signal in that early run. `crab_platform` and `healthy_bank` are well-separated, so the network has the capacity to discriminate when the spectral / spatial difference is large enough — `crab_edge` was the regime where the synthetic signal wasn't sharp enough.
 
-A separate caveat: the most recent training run also had several validation classes with zero pixels because of the spatial-split sparsity (small synthetic extent + 100 m block size). After widening the synthetic marsh to 60 m and dropping `BLOCK_SIZE_M` to 3, the validation set now has 5 of 6 classes represented (only `other` remains sparse because the 'other' polygons mostly sit in the M2 extent rather than the M1 window). This is good enough for synthetic-stage evaluation; class-0 representation will be addressed naturally by real-data labeling.
+A separate caveat: an earlier training run also had several validation classes with zero pixels because of the spatial-split sparsity (small synthetic extent + 100 m block size). After widening the synthetic marsh to 60 m and dropping `BLOCK_SIZE_M` to 3, the validation set now has 5 of 6 classes represented (only `other` remains sparse because the 'other' polygons mostly sit in the M2 extent rather than the M1 window). This is good enough for synthetic-stage evaluation; class-0 representation will be addressed naturally by real-data labeling.
+
+### Update — rule experiments and margin-tie diagnostics (latest synthetic model)
+
+The full decision-rule sweep and the abstain machinery were re-run on the most recent Model 1 (a stronger band set than the `pan + NDVI + NDRE` baseline above). Two things stand out, both consistent with the active-learning design.
+
+**The model is now near-saturated on synthetic data.** Under argmax, `crab_edge` recall is 0.86 (only ~6% leaking to `healthy_bank`), a large improvement over the 0.49 baseline — the synthetic `crab_edge`/`healthy_bank` confusion that was the earlier "dominant failure mode" has largely closed on this data. Across all rules — argmax, the priority and soft-cascade variants, and the abstain rules — the diagonals are within a point or two of each other and abstention rates are tiny (0.3%–2.5%). The rules behave exactly as designed: entropy abstains the least and is the least-targeted detector of this confusion (because the confusion is low-entropy), while `argmax_abstain` trades the most coverage for the best diagonal. This validates the implementation, but it also means synthetic has little headroom left to differentiate rules — the production rule choice and the abstain thresholds wait for real data, where genuine ambiguity will populate the bucket. (`priority_crab_only` is the one structural outlier, and correctly so: it routes all non-crab classes to "other" while preserving the crab classes — a crab-vs-everything operating point, not an improvement on the hard discrimination.)
+
+**The margin-tie diagnostic reorders the story.** Reporting which pairs of classes the model is most often torn between, at `min_margin < 0.15` (0.8% of pixels):
+
+| Tied pair | Count | Type | Effect on damage-*area* metric |
+|---|---|---|---|
+| crab_edge ↔ crab_platform | 8,803 | within-damage | none (both count as damage) |
+| eroding_non_crab ↔ crab_platform | 8,073 | boundary-crossing | flips pixel in/out of damage total |
+| healthy_bank ↔ eroding_non_crab | 6,280 | non-damage | none |
+| healthy_bank ↔ crab_edge | 5,112 | boundary-crossing | flips pixel in/out of damage total |
+| crab_edge ↔ collapsed | 2,322 | within-damage | none |
+
+Note that this is *hesitation*, not error: both crab classes have high recall, so these are close calls the model usually resolves correctly — but they are exactly the high-information pixels for the labeling queue. The `crab_edge`↔`crab_platform` dominance is consistent with the spectral table, where both classes sit near NDVI ≈ 0.
+
+This raises a labeling-priority question tied to our headline metric. Because we measure *area* of crab damage, a tie's value depends on whether resolving it changes whether a pixel counts as damage at all (the "Type" column above). The single largest tie (`crab_edge`↔`crab_platform`) barely moves the area metric, while the metric-relevant ties are the boundary-crossing ones. The current `require_classes` filter keeps any tie involving a listed class ("at least one in the set"), which *cannot* express "keep only boundary-crossing pairs" — that would need a separate "exactly one damage class" filter. We are deferring that refinement to real data: the tie structure will reorder on real imagery, and within-damage labels still sharpen the model even when they don't move the area metric, so the boundary-crossing filter only becomes worthwhile if labeling volume turns out to be the bottleneck. Whether `collapsed` counts as "damage" for this grouping is one more question for the ecologist sign-off.
 
 ## What's Pending
 
 - Real drone flights (scheduled for the upcoming flight window)
-- QGIS hand-labeling of crab polygons over real 1 cm imagery (Model 1 training data)
+- QGIS hand-labeling of crab polygons over real 1 cm imagery (Model 1 training data) — now driven by the active-learning review queue (section 8) rather than exhaustive labeling
 - Hand-labeling of 'other' polygons over real 4 cm imagery (Model 2 training data)
 - Model 2 training notebook (structural copy of M1 with adjustments for the larger extent, lower resolution, and combined supervision sources)
 - Model 2 production notebook
 - Re-run of band experiments on real data
+- First-flight tuning of the active-learning parameters (superpixel weights/compactness/size from the boundary overlay; abstain `min_margin`/`mass_cutoff` and per-class `CONFIDENCE_THRESHOLDS` from the first real validation set; `min_abstain_frac` from the labeling budget)
+- Running the active-learning loop on real flights (predict → abstain bucket → review queue → label → retrain), for as many rounds as the residual uncertainty warrants
+- Decision on the damage-area pair filter / damage grouping (with the ecologist), if labeling volume warrants the boundary-crossing refinement
 - Per-flight metadata capture: panel times, sun angle, cloud cover, tide stage
 - Kayak ground-truth observations for validation
 - Ecologist sign-off on the 6-class scheme
@@ -287,6 +354,7 @@ A separate caveat: the most recent training run also had several validation clas
 
 - Python 3.12, PyTorch 2.x, segmentation-models-pytorch
 - Rasterio, GeoPandas, Shapely for geospatial I/O
+- scikit-image for SLIC superpixels and morphology
 - Albumentations for augmentation
 - scikit-learn for evaluation metrics
 - Pandas + Matplotlib for results analysis
@@ -302,16 +370,25 @@ A separate caveat: the most recent training run also had several validation clas
 | Derived band library | Complete (14+ bands) |
 | Synthetic data generator | Complete, validated end-to-end |
 | Model 1 training notebook | Complete |
-| Model 1 production notebook | Complete |
+| Model 1 production notebook | Complete (now caches softmax + partitions abstain pixels) |
 | Band-experiments notebook + framework | Complete |
+| Superpixel container builder | Complete (synthetic-validated) |
+| Abstain-bucket builder | Complete (synthetic-validated) |
+| Review-polygon (active-learning) builder | Complete (synthetic-validated) |
+| Raster-alignment checker | Complete |
 | Model 2 training notebook | Pending (post real-data labeling) |
 | Model 2 production notebook | Pending |
 | Real-data labeling | Pending (post flights) |
+| Active-learning loop on real data | Pending (post flights) |
 | Ecologist class-scheme review | Pending |
 
 ## Glossary
 
 For readers from different backgrounds — terms used throughout this report.
+
+**Abstain bucket** — The set of pixels where the chosen decision rule (margin) declines to commit a label, carved out of the prediction and routed to review instead. Stored as a per-pixel raster of contested-pair codes (section 8).
+
+**Active learning** — A training strategy in which the model's own uncertainty selects which unlabeled data to label next, so expert effort goes where it most improves the model rather than to data the model already handles. Here, Model 1's uncertain regions are surfaced for targeted QGIS labeling and fed back into training.
 
 **Argmax** — Machine learning models typically provide a probability for each class, given an input image. These probabilities are normalized to 1 across all classes, e.g., with 6 classes, the 6 probabilities would add to 1.0. This is called softmax. Argmax is a decision rule that selects the highest-probability class from a softmax output. The simplest possible inference rule. The problem arises when no single probability is dominant. That leads us to consider other approaches (see section 7).
 
@@ -323,6 +400,10 @@ For readers from different backgrounds — terms used throughout this report.
 
 **Confusion matrix** — Table where rows are true classes and columns are predicted classes; the diagonal is correct predictions and off-diagonal entries are specific errors. Used to identify *which* classes are getting confused with *which* others.
 
+**Container** — A single superpixel treated as one labelable unit in the active-learning loop. The abstain bucket is aggregated to containers, and high-abstain containers are promoted to the review queue.
+
+**Contested pair** — The two classes a pixel's softmax is split between under a margin tie (e.g. `healthy_bank | crab_edge`). Recorded per pixel and per review container, so each labeling unit carries the specific two-way question the model couldn't answer.
+
 **CRS (Coordinate Reference System)** — System for mapping 2D coordinates to real-world locations. We use EPSG:26919 (NAD83 / UTM zone 19N).
 
 **DEM (Digital Elevation Model)** — Raster where each pixel's value is the surface elevation. Produced from drone imagery via photogrammetry.
@@ -331,17 +412,19 @@ For readers from different backgrounds — terms used throughout this report.
 
 **EPSG** — Standard code system for spatial reference systems, originated by the European Petroleum Survey Group. EPSG:26919 corresponds to the UTM zone covering New England.
 
-**GeoPackage / Shapefile** — File formats for vector geometry. Shapefile is the legacy (and most widely supported) format; GeoPackage is the modern alternative.
+**GeoPackage / Shapefile** — File formats for vector geometry. Shapefile is the legacy (and most widely supported) format; GeoPackage is the modern alternative, and the one we now prefer (single file, no field-name truncation, multiple layers per file).
 
 **GSD (Ground Sampling Distance)** — Spatial resolution of imagery: real-world distance covered by one pixel. 1 cm GSD = 1 cm per pixel. Determined by sensor and flight altitude.
 
-**Hand-labeling** — Process of an expert drawing polygons in QGIS over imagery, providing ground truth that the model trains against.
+**Hand-labeling** — Process of an expert drawing polygons in QGIS over imagery, providing ground truth that the model trains against. Under the active-learning loop, the expert mostly confirms/splits pre-drawn review containers rather than digitizing from scratch.
 
 **IGNORE_INDEX (255)** — Special pixel label that the loss function skips during training. Used for unlabeled pixels in the open-world labeling scheme. Pixels with this value contribute nothing to training or evaluation.
 
 **ImageNet** — Massive labeled image dataset used to pre-train general-purpose image classifiers. Our U-Net encoder is initialized from ImageNet weights, then fine-tuned on the marsh task.
 
 **IoU (Intersection over Union)** — Segmentation accuracy metric for a single class: (predicted ∩ true) / (predicted ∪ true). Range 0-1; 1 = perfect overlap. Also called Jaccard index.
+
+**Margin (top-2 margin) / margin sampling** — The gap between the highest and second-highest class probabilities for a pixel. A small margin marks a two-way tie. Selecting low-margin pixels for labeling is "margin sampling," a standard active-learning acquisition rule, and the one used for the abstain bucket because it yields the contested pair.
 
 **mIoU (mean IoU)** — Mean IoU across all classes; a single-number summary of model performance.
 
@@ -379,7 +462,8 @@ For readers from different backgrounds — terms used throughout this report.
 
 ***Spartina alterniflora*** — Smooth cordgrass, the dominant vegetation of New England salt marshes. Healthy *Spartina* is what *Sesarma* feeds on and undermines.
 
+**Superpixel / SLIC** — An appearance-homogeneous clump of adjacent pixels. SLIC (Simple Linear Iterative Clustering) seeds cluster centers on a regular grid and assigns each pixel to the nearest center in a combined colour-plus-position distance, producing compact, roughly equal-size regions that respect real edges. Used as the labeling containers for the abstain bucket (section 8).
+
 **TPI (Topographic Position Index)** — Per-pixel measure of elevation relative to a local neighborhood mean. Positive = local high (ridge/bump), negative = local low (depression). Multi-scale.
 
 **TRI (Terrain Ruggedness Index)** — Per-pixel measure of surface roughness: mean absolute elevation difference from a center pixel to its 8 neighbors. From Riley et al. 1999.
-
