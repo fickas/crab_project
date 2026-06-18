@@ -98,6 +98,216 @@ IDX_TO_SPECTRA = {v: SPECTRA[k] for k, v in SPECTRAL_IDX.items()}
 
 #==============================================================
 
+"""Ground-truth normalization helpers (for marsh_utils).
+
+Turn a team-delivered polygon layer (QGIS shapefile or GeoPackage) into the
+canonical ground-truth GeoDataFrame. Idempotent, and driven by a Config object
+passed in from the notebook -- nothing about the class scheme is hardcoded here.
+
+    from marsh_utils import inspect_gt, is_normalized, normalize_gt, write_gt
+
+    inspect_gt(Config, "team_polys.gpkg")
+    gdf = normalize_gt(Config, "team_polys.gpkg")     # uses Config.CLASS_COLUMN
+    write_gt(Config, gdf)                              # uses Config.GT_PATH
+
+Class resolution:
+  If Config.QGIS_TO_MODEL exists, the values in the class column are treated as
+  QGIS codes and mapped strictly through it to model ids (then named via
+  CLASS_NAMES). Any value not in the map is reported as an error rather than
+  guessed. If QGIS_TO_MODEL is absent, the column is read as model ids or names.
+
+Config attributes used (required vs optional noted in the message that shipped this).
+"""
+from __future__ import annotations
+
+import datetime as dt
+import os
+
+import geopandas as gpd
+
+# Fallbacks used only when Config doesn't define the corresponding attribute.
+DEFAULT_LAYER = "ground_truth"
+DEFAULT_SOURCE_PI = "pi_digitized"
+DEFAULT_CLASS_FIELDS = ["Class", "class_id", "class", "classid", "label",
+                        "type", "category", "gridcode", "value", "dn"]
+DEFAULT_PALETTE = {
+    0: ("other", "150,150,150,255"), 1: ("healthy_bank", "60,150,90,255"),
+    2: ("eroding_non_crab", "200,170,90,255"), 3: ("crab_edge", "230,140,60,255"),
+    4: ("crab_platform", "200,70,110,255"), 5: ("collapsed", "140,40,70,255"),
+}
+
+# Marker columns meaning "this layer is already normalized".
+REQUIRED = ("class_id", "class_name", "source")
+
+
+def _opt(config, attr, default):
+    return getattr(config, attr, default)
+
+
+def _id_to_name(config):
+    """{model_id: name} from Config.CLASS_NAMES (list, {id:name}, or {name:id})."""
+    cn = getattr(config, "CLASS_NAMES", None)
+    if cn is None:
+        raise ValueError("Config must define CLASS_NAMES (list or dict).")
+    if isinstance(cn, dict):
+        if all(isinstance(v, int) for v in cn.values()):      # {name: id}
+            return {int(v): str(k) for k, v in cn.items()}
+        return {int(k): str(v) for k, v in cn.items()}        # {id: name}
+    return {i: str(n) for i, n in enumerate(cn)}              # list/tuple
+
+
+def _keys(val):
+    """Candidate lookup keys for a raw cell value (handles int/float/str variants)."""
+    out = [val]
+    for f in (lambda v: int(v), lambda v: int(float(v))):
+        try:
+            out.append(f(val))
+        except (TypeError, ValueError):
+            pass
+    out += [str(val), str(val).strip()]
+    seen, res = set(), []
+    for k in out:
+        if k not in seen:
+            seen.add(k)
+            res.append(k)
+    return res
+
+
+def _load(src, layer=None):
+    if isinstance(src, gpd.GeoDataFrame):
+        return src.copy()
+    return gpd.read_file(src, layer=layer) if layer else gpd.read_file(src)
+
+
+def is_normalized(gdf) -> bool:
+    """True if the layer already carries the GT schema (so don't re-normalize)."""
+    return set(REQUIRED).issubset(set(getattr(gdf, "columns", [])))
+
+
+def resolve_class(config, val):
+    """value -> (class_id, class_name). Uses QGIS_TO_MODEL if Config defines it."""
+    i2n = _id_to_name(config)
+    n2i = {v.lower(): k for k, v in i2n.items()}
+    q2m = getattr(config, "QGIS_TO_MODEL", None)
+    if q2m:
+        for k in _keys(val):
+            if k in q2m:
+                mid = int(q2m[k])
+                return mid, i2n.get(mid)
+        return None, None                       # strict: must resolve via the map
+    for k in _keys(val):                        # no QGIS map: id or name
+        if isinstance(k, int) and k in i2n:
+            return k, i2n[k]
+        if isinstance(k, str) and k.lower() in n2i:
+            return n2i[k.lower()], i2n[n2i[k.lower()]]
+    return None, None
+
+
+def inspect_gt(config, src, layer=None):
+    """Peek: columns, CRS, geometry, and candidate class fields with distinct values."""
+    gdf = _load(src, layer)
+    print(f"{len(gdf)} features")
+    print("columns :", list(gdf.columns))
+    print("geometry:", sorted(set(gdf.geom_type)))
+    print("CRS     :", gdf.crs)
+    print("already normalized?", is_normalized(gdf))
+    fields = [getattr(config, "CLASS_COLUMN", None)] + _opt(config, "GT_CLASS_FIELDS", DEFAULT_CLASS_FIELDS)
+    for c in dict.fromkeys(f for f in fields if f):
+        if c in gdf.columns:
+            print(f"  class field {c!r}: {sorted(map(str, gdf[c].dropna().unique()))[:20]}")
+    return gdf
+
+
+def normalize_gt(config, src, class_field=None, fixed_class=None, layer=None,
+                 source=None, verbose=True):
+    """Return a canonical GT GeoDataFrame. Idempotent: if `src` already has the GT
+    schema it is returned unchanged."""
+    gdf = _load(src, layer)
+    if is_normalized(gdf):
+        if verbose:
+            print(f"already normalized ({len(gdf)} polys); leaving as-is.")
+        return gdf
+
+    if fixed_class is not None:
+        cid, cname = resolve_class(config, fixed_class)
+        if cid is None:
+            raise ValueError(f"fixed_class {fixed_class!r} did not resolve to a class.")
+        ids, names = [cid] * len(gdf), [cname] * len(gdf)
+    else:
+        candidates = [class_field, getattr(config, "CLASS_COLUMN", None)] + \
+                     _opt(config, "GT_CLASS_FIELDS", DEFAULT_CLASS_FIELDS)
+        field = next((c for c in candidates if c and c in gdf.columns), None)
+        if field is None:
+            raise ValueError(
+                f"no class column found (looked for {[c for c in candidates if c]}); "
+                f"columns are {list(gdf.columns)}. Pass class_field= or fixed_class=."
+            )
+        ids, names, bad = [], [], set()
+        for v in gdf[field]:
+            i, n = resolve_class(config, v)
+            (bad.add(v) if i is None else None)
+            ids.append(i)
+            names.append(n)
+        if bad:
+            raise ValueError(
+                f"these {field!r} values didn't resolve to a class: "
+                f"{sorted(map(str, bad))[:20]}. "
+                f"Check Config.QGIS_TO_MODEL / CLASS_NAMES."
+            )
+
+    out = gpd.GeoDataFrame({
+        "geometry": gdf.geometry.values,
+        "class_id": [int(i) for i in ids],
+        "class_name": names,
+        "source": source or _opt(config, "GT_SOURCE_PI", DEFAULT_SOURCE_PI),
+        "flight": None,
+        "superpixel_id": None,
+        "labeler": None,
+        "method": None,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "clipped": False,
+    }, geometry="geometry", crs=gdf.crs)
+
+    if verbose:
+        print(f"normalized {len(out)} '{out['source'].iloc[0]}' polys; class breakdown:")
+        print(out.groupby("class_name").size().to_string())
+    return out
+
+
+def write_qml(config, path):
+    palette = _opt(config, "GT_PALETTE", DEFAULT_PALETTE)
+    cats, syms = [], []
+    for cid, (name, rgba) in palette.items():
+        cats.append(f'<category render="true" value="{cid}" symbol="{cid}" label="{name}"/>')
+        syms.append(
+            f'<symbol type="fill" name="{cid}" alpha="1" clip_to_extent="1" force_rhr="0">'
+            f'<layer class="SimpleFill" enabled="1" locked="0" pass="0">'
+            f'<prop k="color" v="{rgba}"/><prop k="style" v="solid"/>'
+            f'<prop k="outline_color" v="35,35,35,255"/><prop k="outline_style" v="solid"/>'
+            f'<prop k="outline_width" v="0.1"/></layer></symbol>'
+        )
+    with open(path, "w") as f:
+        f.write(
+            '<!DOCTYPE qgis>\n<qgis styleCategories="Symbology" version="3.28">\n'
+            '  <renderer-v2 type="categorizedSymbol" attr="class_id" forceraster="0" enableorderby="0">\n'
+            '    <categories>\n      ' + "\n      ".join(cats) + '\n    </categories>\n'
+            '    <symbols>\n      ' + "\n      ".join(syms) + '\n    </symbols>\n'
+            '  </renderer-v2>\n</qgis>\n'
+        )
+
+
+def write_gt(config, gdf, path=None, layer=None, qml=True):
+    """Write the canonical GT to a GeoPackage (+ a .qml style)."""
+    path = path or _opt(config, "GT_PATH", None)
+    if path is None:
+        raise ValueError("no path given and Config.GT_PATH not set")
+    layer = layer or _opt(config, "GT_LAYER", DEFAULT_LAYER)
+    gdf.to_file(path, layer=layer, driver="GPKG")
+    if qml:
+        write_qml(config, os.path.splitext(path)[0] + ".qml")
+    print(f"wrote {len(gdf)} polys -> {path} (layer {layer!r})")
+    return path
+
 def recommended_batch_size():
     if not torch.cuda.is_available():
         return 1
