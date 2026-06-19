@@ -2283,14 +2283,18 @@ def _names(config):
 
 
 def gt_disagreement(config, prob_raster_path, gt=None, layer=None,
-                    all_touched=False, out_raster=None, verbose=True):
+                    all_touched=False, out_raster=None, mode="binary", verbose=True):
     """Where GT exists, compare the model's argmax class to the GT class.
 
     config           : project Config (GT_PATH default, CLASS_NAMES for labels).
     prob_raster_path : the softmax raster (full_probs).
     gt               : GT polygons as path or GeoDataFrame; defaults to Config.GT_PATH.
-    out_raster       : optional path for a disagreement raster
-                       (0 = agree, 1 = disagree, 255 = no GT here).
+    out_raster       : optional path for a disagreement raster.
+    mode             : 'binary' (0 = agree, 1 = disagree, 255 = no GT), or
+                       'predicted_class' (disagreement pixels carry the class the
+                       model wrongly predicted, 0..5; agree/no-GT = 255 nodata).
+                       In predicted_class mode a matching .qml is written if
+                       Config.GT_PALETTE is set, so it colors with the class palette.
     Returns a stats dict (totals + per-true-class breakdown). The probs/GT are
     read only; nothing is modified.
     """
@@ -2339,12 +2343,19 @@ def gt_disagreement(config, prob_raster_path, gt=None, layer=None,
 
     if out_raster:
         out = np.full((H, W), NODATA, np.uint8)
-        out[gt_mask] = 0
-        out[disagree] = 1
+        if mode == "predicted_class":
+            out[disagree] = pred[disagree].astype(np.uint8)   # what the model wrongly called it
+        elif mode == "binary":
+            out[gt_mask] = 0
+            out[disagree] = 1
+        else:
+            raise ValueError(f"mode must be 'binary' or 'predicted_class', got {mode!r}")
         prof = profile.copy()
         prof.update(count=1, dtype="uint8", nodata=NODATA)
         with rasterio.open(out_raster, "w", **prof) as dst:
             dst.write(out, 1)
+        if mode == "predicted_class":
+            _write_disagree_qml(config, out_raster)
 
     stats = {"gt_pixels": n_gt, "disagree_pixels": n_dis,
              "overall_acc": (1 - n_dis / n_gt) if n_gt else None,
@@ -2357,6 +2368,28 @@ def gt_disagreement(config, prob_raster_path, gt=None, layer=None,
             tc = f" (most -> {b['top_confused_with'][1]})" if b['top_confused_with'] else ""
             print(f"  class {c} {b['name'] or ''}: {b['wrong_px']:,}/{b['gt_px']:,} wrong{tc}")
     return stats
+
+
+def _write_disagree_qml(config, raster_path):
+    """Write a QGIS .qml that colors a single-band class raster (0..5) with the
+    project class palette. No-op if Config.GT_PALETTE isn't set."""
+    import os
+    palette = getattr(config, "GT_PALETTE", None)
+    if not palette:
+        return
+    entries = []
+    for cid, (name, rgba) in palette.items():
+        r, g, b, a = [int(x) for x in str(rgba).split(",")]
+        entries.append(f'<paletteEntry value="{int(cid)}" color="#{r:02x}{g:02x}{b:02x}" '
+                       f'alpha="{a}" label="{name}"/>')
+    with open(os.path.splitext(raster_path)[0] + ".qml", "w") as f:
+        f.write(
+            '<!DOCTYPE qgis>\n<qgis styleCategories="Symbology">\n  <pipe>\n'
+            '    <rasterrenderer type="paletted" band="1" opacity="1">\n'
+            '      <colorPalette>\n        ' + "\n        ".join(entries) + '\n'
+            '      </colorPalette>\n    </rasterrenderer>\n  </pipe>\n</qgis>\n'
+        )
+      
 def check_alignment(reference_path, *other_paths, precision=1e-6, verbose=True):
     """Check that rasters share CRS, transform, and shape with a reference.
 
