@@ -2269,6 +2269,94 @@ def reduce_abstain_with_gt(config, abstain_path, out_path, gt=None,
               f"(settled {stats['settled_by_gt']:,} under {stats['gt_pixels']:,} GT px)")
     return reduced, stats
 
+
+def _names(config):
+    """{id: name} from Config.CLASS_NAMES (list or dict), or {} if unavailable."""
+    cn = getattr(config, "CLASS_NAMES", None)
+    if cn is None:
+        return {}
+    if isinstance(cn, dict):
+        if all(isinstance(v, int) for v in cn.values()):
+            return {int(v): str(k) for k, v in cn.items()}
+        return {int(k): str(v) for k, v in cn.items()}
+    return {i: str(n) for i, n in enumerate(cn)}
+
+
+def gt_disagreement(config, prob_raster_path, gt=None, layer=None,
+                    all_touched=False, out_raster=None, verbose=True):
+    """Where GT exists, compare the model's argmax class to the GT class.
+
+    config           : project Config (GT_PATH default, CLASS_NAMES for labels).
+    prob_raster_path : the softmax raster (full_probs).
+    gt               : GT polygons as path or GeoDataFrame; defaults to Config.GT_PATH.
+    out_raster       : optional path for a disagreement raster
+                       (0 = agree, 1 = disagree, 255 = no GT here).
+    Returns a stats dict (totals + per-true-class breakdown). The probs/GT are
+    read only; nothing is modified.
+    """
+    import geopandas as gpd
+
+    gt = gt if gt is not None else getattr(config, "GT_PATH", None)
+    if gt is None:
+        raise ValueError("no GT given and Config.GT_PATH not set")
+    gdf = gt if isinstance(gt, gpd.GeoDataFrame) else gpd.read_file(
+        gt, layer=(layer or getattr(config, "GT_LAYER", DEFAULT_GT_LAYER)))
+    if "class_id" not in gdf.columns:
+        raise ValueError("GT needs a 'class_id' column (run normalize_gt first).")
+
+    with rasterio.open(prob_raster_path) as src:
+        pred = src.read().argmax(axis=0).astype(np.int32)   # (H, W) class index
+        profile, rast_crs, transform = src.profile, src.crs, src.transform
+        H, W = src.height, src.width
+
+    if gdf.crs is not None and rast_crs is not None and gdf.crs != rast_crs:
+        gdf = gdf.to_crs(rast_crs)
+
+    NODATA = 255
+    shapes = [(g, int(c)) for g, c in zip(gdf.geometry, gdf["class_id"])
+              if g is not None and not g.is_empty]
+    gt_class = rasterize(shapes, out_shape=(H, W), transform=transform,
+                         fill=NODATA, all_touched=all_touched, dtype="int32")
+    gt_mask = gt_class != NODATA
+    disagree = gt_mask & (pred != gt_class)
+
+    n_gt, n_dis = int(gt_mask.sum()), int(disagree.sum())
+    names = _names(config)
+    breakdown = {}
+    for c in sorted(int(x) for x in np.unique(gt_class[gt_mask])):
+        m = gt_class == c
+        tot = int(m.sum())
+        wrong = int((m & (pred != c)).sum())
+        top = None
+        if wrong:
+            wp = pred[m & (pred != c)]
+            vals, counts = np.unique(wp, return_counts=True)
+            tc = int(vals[counts.argmax()])
+            top = (tc, names.get(tc))
+        breakdown[c] = {"name": names.get(c), "gt_px": tot, "wrong_px": wrong,
+                        "acc": (1 - wrong / tot) if tot else None,
+                        "top_confused_with": top}
+
+    if out_raster:
+        out = np.full((H, W), NODATA, np.uint8)
+        out[gt_mask] = 0
+        out[disagree] = 1
+        prof = profile.copy()
+        prof.update(count=1, dtype="uint8", nodata=NODATA)
+        with rasterio.open(out_raster, "w", **prof) as dst:
+            dst.write(out, 1)
+
+    stats = {"gt_pixels": n_gt, "disagree_pixels": n_dis,
+             "overall_acc": (1 - n_dis / n_gt) if n_gt else None,
+             "by_true_class": breakdown}
+    if verbose:
+        acc = stats["overall_acc"]
+        print(f"GT pixels {n_gt:,} | disagree {n_dis:,} | "
+              f"acc {acc:.3f}" if acc is not None else "no GT pixels")
+        for c, b in breakdown.items():
+            tc = f" (most -> {b['top_confused_with'][1]})" if b['top_confused_with'] else ""
+            print(f"  class {c} {b['name'] or ''}: {b['wrong_px']:,}/{b['gt_px']:,} wrong{tc}")
+    return stats
 def check_alignment(reference_path, *other_paths, precision=1e-6, verbose=True):
     """Check that rasters share CRS, transform, and shape with a reference.
 
