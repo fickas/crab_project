@@ -2204,6 +2204,7 @@ from __future__ import annotations
 import numpy as np
 import rasterio
 from rasterio.features import rasterize
+from rasterio.enums import ColorInterp
 
 DEFAULT_GT_LAYER = "ground_truth"
 CONFIDENT_CODE = 0          # abstain code meaning "no question here"
@@ -2389,6 +2390,200 @@ def _write_disagree_qml(config, raster_path):
             '      <colorPalette>\n        ' + "\n        ".join(entries) + '\n'
             '      </colorPalette>\n    </rasterrenderer>\n  </pipe>\n</qgis>\n'
         )
+
+
+def _palette_rgba(config):
+    """{id: (r,g,b,a floats 0-1)} and {id: name} from Config, with a fallback cmap."""
+    names = _names(config)
+    pal = getattr(config, "GT_PALETTE", None)
+    rgba = {}
+    if pal:
+        for cid, (_, s) in pal.items():
+            r, g, b, a = [int(x) for x in str(s).split(",")]
+            rgba[int(cid)] = (r / 255, g / 255, b / 255, a / 255)
+    else:
+        import matplotlib.cm as cm
+        ids = sorted(names) or list(range(6))
+        for i, cid in enumerate(ids):
+            rgba[cid] = cm.tab10(i % 10)
+    return rgba, names
+
+
+def view_disagreements(config, prob_raster_path, gt=None, ortho_path=None,
+                       layer=None, all_touched=False, max_px=1500,
+                       truecolor_bands=(3, 2, 1), alpha=0.75, gt_outline=True,
+                       out_png=None, ax=None, verbose=True):
+    """Render disagreements inline, no QGIS: ortho truecolor base + disagreement
+    pixels colored by the model's PREDICTED class + GT polygon outlines colored by
+    the TRUE class + legend. A disagreement reads as outline-color (truth) vs
+    fill-color (what the model said). Image is decimated for display; use
+    gt_disagreement() for exact pixel counts. Returns the matplotlib Axes.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import geopandas as gpd
+    from rasterio.enums import Resampling
+
+    gt = gt if gt is not None else getattr(config, "GT_PATH", None)
+    if gt is None:
+        raise ValueError("no GT given and Config.GT_PATH not set")
+    gdf = gt if isinstance(gt, gpd.GeoDataFrame) else gpd.read_file(
+        gt, layer=(layer or getattr(config, "GT_LAYER", DEFAULT_GT_LAYER)))
+    if "class_id" not in gdf.columns:
+        raise ValueError("GT needs a 'class_id' column (run normalize_gt first).")
+
+    # decimated read of the probs -> argmax on the display grid
+    with rasterio.open(prob_raster_path) as src:
+        H, W, crs = src.height, src.width, src.crs
+        scale = max(1, int(np.ceil(max(H, W) / max_px)))
+        oh, ow = max(1, H // scale), max(1, W // scale)
+        probs = src.read(out_shape=(src.count, oh, ow), resampling=Resampling.bilinear)
+        t = src.transform * src.transform.scale(W / ow, H / oh)
+    pred = probs.argmax(0).astype(np.int32)
+
+    if gdf.crs is not None and crs is not None and gdf.crs != crs:
+        gdf = gdf.to_crs(crs)
+    gt_class = rasterize([(g, int(c)) for g, c in zip(gdf.geometry, gdf["class_id"])
+                          if g is not None and not g.is_empty],
+                         out_shape=(oh, ow), transform=t, fill=255,
+                         all_touched=all_touched, dtype="int32")
+    gt_mask = gt_class != 255
+    disagree = gt_mask & (pred != gt_class)
+
+    left, top = t.c, t.f
+    right, bottom = left + ow * t.a, top + oh * t.e
+    extent = (left, right, bottom, top)
+
+    if ax is None:
+        _, ax = plt.subplots(figsize=(10, 10 * oh / ow))
+    ax.set_facecolor("white")
+
+    if ortho_path:
+        with rasterio.open(ortho_path) as o:
+            rgb = o.read(list(truecolor_bands), out_shape=(3, oh, ow),
+                         resampling=Resampling.bilinear).astype("float32")
+        disp = np.zeros((oh, ow, 3), "float32")
+        for i in range(3):
+            band = rgb[i]
+            lo, hi = np.percentile(band, (2, 98))
+            disp[..., i] = np.clip((band - lo) / (hi - lo + 1e-9), 0, 1)
+        ax.imshow(disp, extent=extent, origin="upper")
+
+    rgba_map, names = _palette_rgba(config)
+    overlay = np.zeros((oh, ow, 4), "float32")
+    present = sorted(int(c) for c in np.unique(pred[disagree])) if disagree.any() else []
+    for c in present:
+        m = disagree & (pred == c)
+        overlay[m] = (*rgba_map.get(c, (1, 0, 0, 1))[:3], alpha)
+    ax.imshow(overlay, extent=extent, origin="upper")
+
+    if gt_outline:
+        for cid, sub in gdf.groupby("class_id"):
+            sub.boundary.plot(ax=ax, color=rgba_map.get(int(cid), (0, 0, 0, 1)),
+                              linewidth=0.8)
+
+    truth_present = sorted(int(c) for c in np.unique(gt_class[gt_mask])) if gt_mask.any() else []
+    handles = [mpatches.Patch(color=rgba_map.get(c, (1, 0, 0, 1)),
+                              label=f"{c} {names.get(c, '')}")
+               for c in sorted(set(present) | set(truth_present))]
+    if handles:
+        ax.legend(handles=handles, title="class (outline=truth, fill=predicted)",
+                  loc="upper right", fontsize=8)
+    ax.set_title("Prediction vs GT disagreements")
+    ax.set_aspect("equal")
+    ax.set_xticks([]); ax.set_yticks([])
+
+    if verbose:
+        n_gt, n_dis = int(gt_mask.sum()), int(disagree.sum())
+        print(f"(display grid {oh}x{ow}, /{scale}) GT px {n_gt:,} | disagree {n_dis:,}")
+    if out_png:
+        ax.figure.savefig(out_png, dpi=150, bbox_inches="tight")
+        if verbose:
+            print(f"saved {out_png}")
+    return ax
+
+
+def ortho_to_rgb(ortho_path, out_rgb, truecolor_bands=(3, 2, 1), pct=(2, 98)):
+    """Stretch selected ortho bands into a display-ready 3-band uint8 RGB GeoTIFF."""
+    with rasterio.open(ortho_path) as src:
+        bands = src.read(list(truecolor_bands)).astype("float32")
+        profile = src.profile
+    out = np.zeros_like(bands, dtype="uint8")
+    for i in range(bands.shape[0]):
+        lo, hi = np.percentile(bands[i], pct)
+        out[i] = (np.clip((bands[i] - lo) / (hi - lo + 1e-9), 0, 1) * 255).astype("uint8")
+    profile.update(count=3, dtype="uint8", nodata=None, compress="deflate")
+    for k in ("tiled", "blockxsize", "blockysize"):
+        profile.pop(k, None)
+    with rasterio.open(out_rgb, "w", **profile) as dst:
+        dst.write(out)
+        dst.colorinterp = [ColorInterp.red, ColorInterp.green, ColorInterp.blue]
+    return out_rgb
+
+
+def class_raster_to_rgba(config, src_raster, out_rgba, nodata=255):
+    """Convert a single-band class raster (ids 0..5, nodata transparent) to a 4-band
+    RGBA GeoTIFF colored by Config.GT_PALETTE -- display-ready for a web map."""
+    rgba_map, _ = _palette_rgba(config)
+    with rasterio.open(src_raster) as src:
+        a = src.read(1)
+        profile = src.profile
+        nod = src.nodata if src.nodata is not None else nodata
+    out = np.zeros((4, *a.shape), np.uint8)
+    for cid, (r, g, b, al) in rgba_map.items():
+        m = a == cid
+        out[0][m], out[1][m], out[2][m], out[3][m] = (
+            int(r * 255), int(g * 255), int(b * 255), int(al * 255))
+    out[3][a == nod] = 0
+    profile.update(count=4, dtype="uint8", nodata=None, compress="deflate")
+    for k in ("tiled", "blockxsize", "blockysize"):
+        profile.pop(k, None)
+    with rasterio.open(out_rgba, "w", **profile) as dst:
+        dst.write(out)
+        dst.colorinterp = [ColorInterp.red, ColorInterp.green,
+                           ColorInterp.blue, ColorInterp.alpha]
+    return out_rgba
+
+
+def disagreement_map(config, prob_raster_path, gt=None, ortho_path=None, layer=None,
+                     truecolor_bands=(3, 2, 1), all_touched=False, tmp_dir="/tmp"):
+    """Interactive Colab map: ortho + disagreement-by-predicted-class + GT outlines,
+    with layer toggles and opacity sliders. Returns a leafmap Map -- display it as
+    the last line of a cell.
+
+    Colab setup (once per session):
+        !pip install leafmap localtileserver -q
+        from google.colab import output; output.enable_custom_widget_manager()
+    """
+    import os
+    import leafmap
+    import geopandas as gpd
+
+    gt = gt if gt is not None else getattr(config, "GT_PATH", None)
+    if gt is None:
+        raise ValueError("no GT given and Config.GT_PATH not set")
+
+    stem = os.path.splitext(os.path.basename(prob_raster_path))[0]
+    dis = os.path.join(tmp_dir, f"{stem}_disagree_pc.tif")
+    rgba = os.path.join(tmp_dir, f"{stem}_disagree_rgba.tif")
+    gt_disagreement(config, prob_raster_path, gt=gt, layer=layer,
+                    all_touched=all_touched, out_raster=dis,
+                    mode="predicted_class", verbose=False)
+    class_raster_to_rgba(config, dis, rgba)
+
+    m = leafmap.Map()
+    if ortho_path:
+        rgb = os.path.join(tmp_dir, f"{os.path.splitext(os.path.basename(ortho_path))[0]}_rgb.tif")
+        ortho_to_rgb(ortho_path, rgb, truecolor_bands)
+        m.add_raster(rgb, layer_name="ortho")
+    m.add_raster(rgba, layer_name="disagreements (predicted class)")
+
+    gdf = gt if isinstance(gt, gpd.GeoDataFrame) else gpd.read_file(
+        gt, layer=(layer or getattr(config, "GT_LAYER", DEFAULT_GT_LAYER)))
+    m.add_gdf(gdf, layer_name="GT (truth)",
+              style={"color": "white", "weight": 1, "fillOpacity": 0})
+    return m
       
 def check_alignment(reference_path, *other_paths, precision=1e-6, verbose=True):
     """Check that rasters share CRS, transform, and shape with a reference.
