@@ -2179,7 +2179,95 @@ def predict_full_raster(
         print(f"Wrote predictions: {output_path}")
         print(f"  shape: {probs_final.shape}  classes: {list(cfg.CLASS_NAMES.values())}")
 
+"""reduce_abstain.py -- GT-aware abstain reduction (for marsh_utils).
+
+Insert between build_abstain_raster and build_abstain_review_polygons in the
+production pipeline. Writes a GT-reduced copy of the abstain raster: pixels
+covered by ground-truth polygons are set to the 'confident' code (0 = settled),
+so already-labeled ground never becomes a review question. The raw abstain raster
+is left untouched (still needed for prediction-vs-GT diagnostics and non-GT abstain).
+
+    out, stats = mu.build_abstain_raster(prob_raster_path, abstain_path, ...)
+    mu.reduce_abstain_with_gt(Config, abstain_path, abstain_reduced_path)   # NEW
+    review_gdf = mu.build_abstain_review_polygons(
+        superpixel_path=superpixel_path,
+        abstain_path=abstain_reduced_path,        # <- reduced, not raw
+        out_gpkg=...,
+    )
+
+IMPORTANT: all_touched must match whatever your training rasterization uses, so a
+pixel counted as 'GT-labeled' in training is exactly a pixel 'settled' here.
+Default False (pixel-center inside polygon), which is rasterio's default.
+"""
+from __future__ import annotations
+
+import numpy as np
 import rasterio
+from rasterio.features import rasterize
+
+DEFAULT_GT_LAYER = "ground_truth"
+CONFIDENT_CODE = 0          # abstain code meaning "no question here"
+
+
+def reduce_abstain_with_gt(config, abstain_path, out_path, gt=None,
+                           layer=None, all_touched=False, confident_code=CONFIDENT_CODE,
+                           verbose=True):
+    """Zero (settle) abstain pixels covered by GT polygons; write reduced raster.
+
+    config       : project Config (uses GT_PATH as the default GT source, GT_LAYER).
+    abstain_path : raw abstain raster -- read only, never modified.
+    out_path     : destination for the reduced abstain raster.
+    gt           : GT polygons as a path or GeoDataFrame; defaults to Config.GT_PATH.
+    Returns (reduced_array, stats).
+    """
+    import geopandas as gpd
+
+    gt = gt if gt is not None else getattr(config, "GT_PATH", None)
+    if gt is None:
+        raise ValueError("no GT given and Config.GT_PATH not set")
+    gdf = gt if isinstance(gt, gpd.GeoDataFrame) else gpd.read_file(
+        gt, layer=(layer or getattr(config, "GT_LAYER", DEFAULT_GT_LAYER)))
+
+    with rasterio.open(abstain_path) as src:
+        abstain = src.read(1)
+        profile = src.profile
+        rast_crs, transform = src.crs, src.transform
+        shape = (src.height, src.width)
+
+    if gdf.crs is not None and rast_crs is not None and gdf.crs != rast_crs:
+        gdf = gdf.to_crs(rast_crs)
+
+    geoms = [g for g in gdf.geometry if g is not None and not g.is_empty]
+    if geoms:
+        gt_mask = rasterize(
+            ((g, 1) for g in geoms), out_shape=shape, transform=transform,
+            fill=0, all_touched=all_touched, dtype="uint8",
+        ).astype(bool)
+    else:
+        gt_mask = np.zeros(shape, dtype=bool)
+        if verbose:
+            print("no GT geometry; reduced raster == raw abstain.")
+
+    reduced = abstain.copy()
+    was_abstain = abstain != confident_code
+    settled = gt_mask & was_abstain
+    reduced[gt_mask] = confident_code
+
+    profile.update(count=1)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(reduced, 1)
+
+    stats = {
+        "abstain_before": int(was_abstain.sum()),
+        "gt_pixels": int(gt_mask.sum()),
+        "settled_by_gt": int(settled.sum()),
+        "abstain_after": int((reduced != confident_code).sum()),
+    }
+    if verbose:
+        print(f"reduced abstain -> {out_path}")
+        print(f"  abstain px {stats['abstain_before']:,} -> {stats['abstain_after']:,} "
+              f"(settled {stats['settled_by_gt']:,} under {stats['gt_pixels']:,} GT px)")
+    return reduced, stats
 
 def check_alignment(reference_path, *other_paths, precision=1e-6, verbose=True):
     """Check that rasters share CRS, transform, and shape with a reference.
