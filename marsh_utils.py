@@ -2280,6 +2280,10 @@ def _names(config):
         return {int(k): str(v) for k, v in cn.items()}
     return {i: str(n) for i, n in enumerate(cn)}
 
+def _pair_codes(n_classes):
+    """Map each unordered class pair to a small integer code (1..C(n,2))."""
+    pairs = list(itertools.combinations(range(n_classes), 2))
+    return {pair: k + 1 for k, pair in enumerate(pairs)}, pairs
 
 def gt_disagreement(config, prob_raster_path, gt=None, layer=None,
                     all_touched=False, out_raster=None, mode="binary", verbose=True):
@@ -2595,8 +2599,7 @@ def write_selection_params(config, prob_raster_path, abstain_path, out_json,
     but too close to call" -- and records its per-class probabilities and the
     contested pair (named). Run right after build_abstain_raster.
     """
-    import itertools
-    import json
+
 
     with rasterio.open(abstain_path) as ab:
         a = ab.read(1)
