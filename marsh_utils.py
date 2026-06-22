@@ -2413,20 +2413,23 @@ def _palette_rgba(config):
 
 def view_disagreements(config, prob_raster_path, gt=None, ortho_path=None,
                        layer=None, all_touched=False, max_px=1500,
-                       truecolor_bands=(3, 2, 1), alpha=0.75, gt_outline=True,
-                       out_png=None, ax=None, verbose=True):
-    """Render disagreements inline, no QGIS: ortho truecolor base + disagreement
-    pixels colored by the model's PREDICTED class + GT polygon outlines colored by
-    the TRUE class + legend. A disagreement reads as outline-color (truth) vs
-    fill-color (what the model said). Image is decimated for display; use
-    gt_disagreement() for exact pixel counts. Returns the matplotlib Axes.
+                       truecolor_bands=(3, 2, 1), alpha=0.8, mode="confusion",
+                       top_n=8, gt_outline=False, out_png=None, ax=None, verbose=True):
+    """Render disagreements inline, no QGIS. Two modes:
+      mode="confusion" (default): each disagreement pixel is colored by its
+        truth->predicted confusion pair, with a legend naming the pairs -- reads
+        cleanly even when disagreements are dense (no faint outlines to squint at).
+      mode="predicted": disagreement pixels colored by the model's predicted class,
+        with optional GT outlines (gt_outline=True) colored by truth class.
+    Image is decimated for display; use gt_disagreement() for exact counts.
+    Returns the matplotlib Axes.
     """
     import numpy as np
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     import geopandas as gpd
     from rasterio.enums import Resampling
-
+ 
     gt = gt if gt is not None else getattr(config, "GT_PATH", None)
     if gt is None:
         raise ValueError("no GT given and Config.GT_PATH not set")
@@ -2434,7 +2437,7 @@ def view_disagreements(config, prob_raster_path, gt=None, ortho_path=None,
         gt, layer=(layer or getattr(config, "GT_LAYER", DEFAULT_GT_LAYER)))
     if "class_id" not in gdf.columns:
         raise ValueError("GT needs a 'class_id' column (run normalize_gt first).")
-
+ 
     # decimated read of the probs -> argmax on the display grid
     with rasterio.open(prob_raster_path) as src:
         H, W, crs = src.height, src.width, src.crs
@@ -2443,7 +2446,7 @@ def view_disagreements(config, prob_raster_path, gt=None, ortho_path=None,
         probs = src.read(out_shape=(src.count, oh, ow), resampling=Resampling.bilinear)
         t = src.transform * src.transform.scale(W / ow, H / oh)
     pred = probs.argmax(0).astype(np.int32)
-
+ 
     if gdf.crs is not None and crs is not None and gdf.crs != crs:
         gdf = gdf.to_crs(crs)
     gt_class = rasterize([(g, int(c)) for g, c in zip(gdf.geometry, gdf["class_id"])
@@ -2452,15 +2455,15 @@ def view_disagreements(config, prob_raster_path, gt=None, ortho_path=None,
                          all_touched=all_touched, dtype="int32")
     gt_mask = gt_class != 255
     disagree = gt_mask & (pred != gt_class)
-
+ 
     left, top = t.c, t.f
     right, bottom = left + ow * t.a, top + oh * t.e
     extent = (left, right, bottom, top)
-
+ 
     if ax is None:
         _, ax = plt.subplots(figsize=(10, 10 * oh / ow))
     ax.set_facecolor("white")
-
+ 
     if ortho_path:
         with rasterio.open(ortho_path) as o:
             rgb = o.read(list(truecolor_bands), out_shape=(3, oh, ow),
@@ -2471,31 +2474,59 @@ def view_disagreements(config, prob_raster_path, gt=None, ortho_path=None,
             lo, hi = np.percentile(band, (2, 98))
             disp[..., i] = np.clip((band - lo) / (hi - lo + 1e-9), 0, 1)
         ax.imshow(disp, extent=extent, origin="upper")
-
+ 
     rgba_map, names = _palette_rgba(config)
-    overlay = np.zeros((oh, ow, 4), "float32")
-    present = sorted(int(c) for c in np.unique(pred[disagree])) if disagree.any() else []
-    for c in present:
-        m = disagree & (pred == c)
-        overlay[m] = (*rgba_map.get(c, (1, 0, 0, 1))[:3], alpha)
-    ax.imshow(overlay, extent=extent, origin="upper")
-
-    if gt_outline:
-        for cid, sub in gdf.groupby("class_id"):
-            sub.boundary.plot(ax=ax, color=rgba_map.get(int(cid), (0, 0, 0, 1)),
-                              linewidth=0.8)
-
-    truth_present = sorted(int(c) for c in np.unique(gt_class[gt_mask])) if gt_mask.any() else []
-    handles = [mpatches.Patch(color=rgba_map.get(c, (1, 0, 0, 1)),
-                              label=f"{c} {names.get(c, '')}")
-               for c in sorted(set(present) | set(truth_present))]
+    handles = []
+ 
+    if mode == "confusion":
+        overlay = np.zeros((oh, ow, 4), "float32")
+        other = (0.55, 0.55, 0.55, 1.0)
+        if disagree.any():
+            keys = gt_class.astype(np.int64) * 1000 + pred   # encode (truth, pred)
+            uniq, counts = np.unique(keys[disagree], return_counts=True)
+            order = np.argsort(-counts)
+            cmap = plt.get_cmap("tab20")
+            assigned = np.zeros((oh, ow), bool)
+            for i, oi in enumerate(order[:top_n]):
+                k = int(uniq[oi]); tr, pr = divmod(k, 1000)
+                col = cmap(i % 20)
+                m = disagree & (keys == k)
+                overlay[m] = (*col[:3], alpha)
+                assigned |= m
+                handles.append(mpatches.Patch(
+                    color=col,
+                    label=f"{names.get(tr, tr)} \u2192 {names.get(pr, pr)}  ({int(counts[oi]):,})"))
+            rem = disagree & ~assigned
+            if rem.any():
+                overlay[rem] = (*other[:3], alpha)
+                handles.append(mpatches.Patch(color=other, label="other pairs"))
+        ax.imshow(overlay, extent=extent, origin="upper")
+        title = "Disagreements by confusion pair (truth \u2192 predicted)"
+    else:
+        overlay = np.zeros((oh, ow, 4), "float32")
+        present = sorted(int(c) for c in np.unique(pred[disagree])) if disagree.any() else []
+        for c in present:
+            overlay[disagree & (pred == c)] = (*rgba_map.get(c, (1, 0, 0, 1))[:3], alpha)
+        ax.imshow(overlay, extent=extent, origin="upper")
+        if gt_outline:
+            for cid, sub in gdf.groupby("class_id"):
+                sub.boundary.plot(ax=ax, color=rgba_map.get(int(cid), (0, 0, 0, 1)),
+                                  linewidth=1.2)
+        truth_present = sorted(int(c) for c in np.unique(gt_class[gt_mask])) if gt_mask.any() else []
+        handles = [mpatches.Patch(color=rgba_map.get(c, (1, 0, 0, 1)),
+                                  label=f"{c} {names.get(c, '')}")
+                   for c in sorted(set(present) | set(truth_present))]
+        title = "Prediction vs GT disagreements"
+ 
     if handles:
-        ax.legend(handles=handles, title="class (outline=truth, fill=predicted)",
+        ax.legend(handles=handles,
+                  title=("truth \u2192 predicted" if mode == "confusion"
+                         else "class (outline=truth, fill=predicted)"),
                   loc="upper right", fontsize=8)
-    ax.set_title("Prediction vs GT disagreements")
+    ax.set_title(title)
     ax.set_aspect("equal")
     ax.set_xticks([]); ax.set_yticks([])
-
+ 
     if verbose:
         n_gt, n_dis = int(gt_mask.sum()), int(disagree.sum())
         print(f"(display grid {oh}x{ow}, /{scale}) GT px {n_gt:,} | disagree {n_dis:,}")
