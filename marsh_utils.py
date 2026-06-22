@@ -1,4 +1,5 @@
 # ── Standard library ──
+from __future__ import annotations
 import os
 import json
 import math
@@ -118,8 +119,6 @@ Class resolution:
 
 Config attributes used (required vs optional noted in the message that shipped this).
 """
-from __future__ import annotations
-
 import datetime as dt
 import os
 
