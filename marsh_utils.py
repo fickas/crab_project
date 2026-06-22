@@ -2198,7 +2198,6 @@ IMPORTANT: all_touched must match whatever your training rasterization uses, so 
 pixel counted as 'GT-labeled' in training is exactly a pixel 'settled' here.
 Default False (pixel-center inside polygon), which is rasterio's default.
 """
-from __future__ import annotations
 
 import numpy as np
 import rasterio
