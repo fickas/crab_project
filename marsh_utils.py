@@ -2584,6 +2584,74 @@ def disagreement_map(config, prob_raster_path, gt=None, ortho_path=None, layer=N
     m.add_gdf(gdf, layer_name="GT (truth)",
               style={"color": "white", "weight": 1, "fillOpacity": 0})
     return m
+
+
+def write_selection_params(config, prob_raster_path, abstain_path, out_json,
+                           min_margin, mass_cutoff, min_abstain_frac,
+                           window_m=None, sample_cap=200000, verbose=True):
+    """Capture the abstain-rule settings + one real example pixel into a JSON the
+    labeler app can read and turn into a plain-English explanation.
+
+    Picks, as the example, the abstain pixel whose top-2 classes most cleanly
+    dominate (largest top-2 mass) -- i.e. "two obviously higher than the rest,
+    but too close to call" -- and records its per-class probabilities and the
+    contested pair (named). Run right after build_abstain_raster.
+    """
+    import itertools
+    import json
+
+    with rasterio.open(abstain_path) as ab:
+        a = ab.read(1)
+    with rasterio.open(prob_raster_path) as sm:
+        P = sm.read().astype("float32")          # (C, H, W)
+    C = P.shape[0]
+    names = _names(config)
+
+    pair_mask = (a >= 1) & (a < 100)             # pair-coded abstain (not diffuse)
+    idx = np.argwhere(pair_mask)
+    example = None
+    if idx.size:
+        if len(idx) > sample_cap:                # cap work on huge rasters
+            sel = np.random.default_rng(0).choice(len(idx), sample_cap, replace=False)
+            idx = idx[sel]
+        probs_at = P[:, idx[:, 0], idx[:, 1]]    # (C, K)
+        srt = np.sort(probs_at, axis=0)
+        mass = srt[-1] + srt[-2]
+        r, c = idx[int(mass.argmax())]
+        ex = P[:, r, c]
+        code = int(a[r, c])
+        pairs = list(itertools.combinations(range(C), 2))
+        ea, eb = pairs[code - 1] if 1 <= code <= len(pairs) else (
+            int(np.argsort(ex)[-1]), int(np.argsort(ex)[-2]))
+        top2 = np.sort(ex)[-2:]
+        example = {
+            "probs": [round(float(x), 3) for x in ex],     # class-id order
+            "pair": [int(ea), int(eb)],
+            "pair_names": [names.get(int(ea)), names.get(int(eb))],
+            "top2_margin": round(float(top2[1] - top2[0]), 3),
+            "top2_mass": round(float(top2[1] + top2[0]), 3),
+        }
+
+    params = {
+        "rule": {
+            "min_margin": float(min_margin),
+            "mass_cutoff": float(mass_cutoff),
+            "min_abstain_frac": float(min_abstain_frac),
+            "window_m": (float(window_m) if window_m is not None else None),
+            "n_classes": int(C),
+        },
+        "class_names": {int(k): v for k, v in names.items()},
+        "example": example,
+    }
+    with open(out_json, "w") as f:
+        json.dump(params, f, indent=2)
+    if verbose:
+        print(f"wrote selection params -> {out_json}")
+        if example:
+            a_, b_ = example["pair_names"]
+            print(f"  example: {a_} vs {b_} "
+                  f"(margin {example['top2_margin']}, mass {example['top2_mass']})")
+    return params
       
 def check_alignment(reference_path, *other_paths, precision=1e-6, verbose=True):
     """Check that rasters share CRS, transform, and shape with a reference.
