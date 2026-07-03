@@ -4003,3 +4003,126 @@ def rule_margin_with_tie_info(probs, min_margin=0.15, abstain_label=255):
     top1 = sorted_idx[:, -1]
     top2 = sorted_idx[:, -2]
     return pred, np.stack([top1[tied], top2[tied]], axis=1)
+
+"""
+condense_pixels_to_regions
+==========================
+Turn a per-pixel classified raster (the production model output) into the
+vectorized GeoJSON that marsh-portal's `load_regions` ingests.
+
+Pipeline (all geometry in the projected CRS; reproject to 4326 only at the end):
+    polygonize each kept class -> dissolve adjacent -> drop < min area
+    -> simplify jagged pixel edges -> reproject to EPSG:4326 -> write GeoJSON
+
+Output contract (what load_regions expects):
+    FeatureCollection; each feature has properties.class in the allowed set
+    (your damage class names + "abstain" + "outline"); geometry Polygon /
+    MultiPolygon in lng/lat (EPSG:4326).
+
+Deps: rasterio, shapely, pyproj  (already in a typical geospatial notebook).
+"""
+from __future__ import annotations
+
+import json
+import numpy as np
+import rasterio
+from rasterio import features
+from shapely.geometry import shape, mapping
+from shapely.ops import unary_union, transform as shp_transform
+from pyproj import Transformer
+
+
+def _polygonize_class(class_raster, transform, class_id):
+    """Return a list of shapely polygons for one class id, in the raster CRS."""
+    mask = (class_raster == class_id).astype(np.uint8)
+    if mask.sum() == 0:
+        return []
+    geoms = [
+        shape(geom)
+        for geom, val in features.shapes(mask, mask=mask.astype(bool), transform=transform)
+        if val == 1
+    ]
+    return geoms
+
+
+def _clean(geoms, min_area_m2, simplify_tol_m):
+    """Dissolve adjacent parts, drop tiny regions, simplify edges. In projected CRS
+    so area and tolerance are in metres."""
+    if not geoms:
+        return []
+    dissolved = unary_union(geoms)                      # merge touching same-class parts
+    parts = list(getattr(dissolved, "geoms", [dissolved]))
+    out = []
+    for p in parts:
+        if p.area < min_area_m2:                         # metres^2 (projected CRS)
+            continue
+        p = p.simplify(simplify_tol_m, preserve_topology=True)
+        if not p.is_empty and p.area >= min_area_m2:
+            out.append(p)
+    return out
+
+
+def condense_pixels_to_regions(
+    class_raster,                 # 2D int ndarray (H, W) of class ids
+    transform,                    # affine transform (raster -> projected coords)
+    src_crs,                      # e.g. "EPSG:26919"
+    class_names,                  # {class_id: "name"}  e.g. {3:"crab_edge", ...}
+    keep_classes,                 # iterable of class ids to emit as damage
+    out_path="regions.geojson",
+    region_min_m2=25.0,           # drop regions smaller than this
+    simplify_tol_m=0.5,           # Douglas-Peucker tolerance, metres
+    abstain_id=None,              # class id for abstain IF it lives in the raster ...
+    abstain_mask=None,            # ... OR a separate boolean (H,W) mask for abstain
+    footprint_geojson=None,       # optional path to footprint.geojson -> added as "outline"
+):
+    to_wgs84 = Transformer.from_crs(src_crs, "EPSG:4326", always_xy=True).transform
+
+    def add(features_list, geoms, cls):
+        for g in geoms:
+            g4326 = shp_transform(to_wgs84, g)          # reproject LAST
+            features_list.append({
+                "type": "Feature",
+                "properties": {"class": cls, "area_m2": round(g.area)},  # area from projected geom
+                "geometry": mapping(g4326),
+            })
+
+    feats = []
+
+    # damage classes
+    for cid in keep_classes:
+        name = class_names[cid]
+        geoms = _clean(_polygonize_class(class_raster, transform, cid),
+                       region_min_m2, simplify_tol_m)
+        add(feats, geoms, name)
+
+    # abstain — either a class id in the raster, or a separate mask
+    if abstain_id is not None:
+        geoms = _clean(_polygonize_class(class_raster, transform, abstain_id),
+                       region_min_m2, simplify_tol_m)
+        add(feats, geoms, "abstain")
+    elif abstain_mask is not None:
+        m = abstain_mask.astype(np.uint8)
+        geoms = [shape(g) for g, v in features.shapes(m, mask=m.astype(bool), transform=transform) if v == 1]
+        add(feats, _clean(geoms, region_min_m2, simplify_tol_m), "abstain")
+
+    # optional: fold the flight footprint in as the outline feature
+    if footprint_geojson:
+        fp = json.load(open(footprint_geojson))
+        of = fp["features"][0]
+        of["properties"] = {"class": "outline"}
+        feats.append(of)
+
+    fc = {"type": "FeatureCollection", "features": feats}
+    with open(out_path, "w") as fh:
+        json.dump(fc, fh)
+    return fc
+
+
+# ---- convenience: read a classified GeoTIFF straight from disk ----------------
+def condense_from_geotiff(tif_path, class_names, keep_classes, out_path="regions.geojson",
+                          band=1, **kw):
+    with rasterio.open(tif_path) as ds:
+        arr = ds.read(band)
+        return condense_pixels_to_regions(
+            arr, ds.transform, ds.crs.to_string(),
+            class_names, keep_classes, out_path=out_path, **kw)
