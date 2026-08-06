@@ -4126,3 +4126,227 @@ def condense_from_geotiff(tif_path, class_names, keep_classes, out_path="regions
         return condense_pixels_to_regions(
             arr, ds.transform, ds.crs.to_string(),
             class_names, keep_classes, out_path=out_path, **kw)
+
+# Add to marsh_utils.py
+#
+# Two-tier label transfer: project a 1cm per-pixel labeling onto the 4cm grid,
+# producing (1) a 4cm label raster, (2) a 4cm abstain raster coded exactly like
+# build_abstain_raster (pair codes 1..C(n,2)), and (3) a 4cm superpixel raster
+# where each signature-grouped abstain region is one id. The three outputs feed
+# the EXISTING abstain_review.build_abstain_review_polygons() -> labeler pipeline
+# unchanged.
+#
+# Decision rule per 4cm cell (block of the 1cm labels whose centres fall in it):
+#   damage classes = CLASSES_OF_INTEREST (e.g. {3,4,5}); non-damage = the rest.
+#   1. no damage in block            -> plurality class (no abstain)
+#   2. plurality class is damage     -> that damage class
+#      (damage vs non-damage tie at top -> damage wins)
+#   3. damage present, plurality non-damage -> ABSTAIN, with pair:
+#        - one damage class present        -> (plurality_nondmg, that_damage)     [1a]
+#        - two damage classes tie plurality-> (dmg_lo, dmg_hi)                     [2]
+#        - many damage, none plurality     -> (plurality_nondmg, largest_minority_damage) [3a]
+#      Empty blocks (no 1cm coverage) -> ignore_index (nodata).
+
+import os
+import json
+import itertools
+import numpy as np
+import rasterio
+from rasterio.transform import xy as _xy
+from scipy import ndimage
+
+
+ABSTAIN_IGNORE = 255   # 4cm cells with no 1cm coverage / ignored
+
+
+def _pair_codes(n_classes):
+    """MIRROR of abstain._pair_codes / abstain_review._code_to_pair:
+    unordered pairs in itertools.combinations(range(n_classes), 2) order,
+    code = k+1. Returns {(a,b): code} with a < b."""
+    return {pair: k + 1 for k, pair in
+            enumerate(itertools.combinations(range(n_classes), 2))}
+
+
+def _blockwise_1cm_labels(labels_1cm, tr_1cm, tr_4cm, shape_4cm, ignore_index):
+    """For each 4cm cell, collect the 1cm label values whose pixel centres fall
+    inside that cell. Returns a dict: (row4, col4) -> np.array of 1cm labels.
+
+    Coordinate-based (not block-reshape), so it is correct even when the 1cm and
+    4cm rasters have different extents/origins (strip vs full marsh, or two real
+    flights in the same CRS)."""
+    h1, w1 = labels_1cm.shape
+    # 1cm pixel-centre coordinates (map units)
+    rows, cols = np.nonzero(labels_1cm != ignore_index)
+    if rows.size == 0:
+        return {}
+    xs, ys = _xy(tr_1cm, rows, cols)          # centres in map coords
+    xs = np.asarray(xs); ys = np.asarray(ys)
+    vals = labels_1cm[rows, cols]
+
+    # Map those coords into 4cm grid indices via the inverse 4cm transform
+    inv = ~tr_4cm
+    fcols, frows = inv * (xs, ys)             # fractional col,row in 4cm grid
+    c4 = np.floor(fcols).astype(np.int64)
+    r4 = np.floor(frows).astype(np.int64)
+
+    H4, W4 = shape_4cm
+    inside = (r4 >= 0) & (r4 < H4) & (c4 >= 0) & (c4 < W4)
+    r4, c4, vals = r4[inside], c4[inside], vals[inside]
+
+    # Group labels by 4cm cell
+    flat = r4 * W4 + c4
+    order = np.argsort(flat, kind="stable")
+    flat_s = flat[order]; vals_s = vals[order]
+    # split points where the cell id changes
+    bounds = np.flatnonzero(np.diff(flat_s)) + 1
+    groups = np.split(vals_s, bounds)
+    keys = flat_s[np.concatenate(([0], bounds))] if flat_s.size else []
+    out = {}
+    for k, g in zip(keys, groups):
+        out[(int(k) // W4, int(k) % W4)] = g
+    return out
+
+
+def _decide_cell(block, damage_ids, n_classes):
+    """Apply the transfer rule to one 4cm cell's 1cm label array.
+    Returns (label, pair) where:
+      - label in 0..n_classes-1  -> assigned class, pair is None
+      - label == 'ABSTAIN'       -> abstain, pair = (a,b) with a<b
+    """
+    counts = np.bincount(block, minlength=n_classes)
+    present = np.flatnonzero(counts)
+    dmg_present = [c for c in present if c in damage_ids]
+
+    top = counts.max()
+    plurality = [c for c in present if counts[c] == top]
+
+    # Rule 1: no damage -> plurality (ties broken by lowest id, deterministic)
+    if not dmg_present:
+        return int(min(plurality)), None
+
+    # Rule 2: a damage class is (tied for) plurality -> damage wins
+    dmg_in_plurality = [c for c in plurality if c in damage_ids]
+    if dmg_in_plurality:
+        if len(dmg_in_plurality) == 1:
+            return int(dmg_in_plurality[0]), None
+        # two+ damage tie for plurality -> Case 2 abstain (which damage?)
+        a, b = sorted(dmg_in_plurality[:2])
+        return "ABSTAIN", (int(a), int(b))
+
+    # Rule 3: damage present, plurality is non-damage
+    plur_nondmg = int(min(plurality))   # the competing background class
+    if len(dmg_present) == 1:
+        a, b = sorted((plur_nondmg, int(dmg_present[0])))          # Case 1a
+        return "ABSTAIN", (a, b)
+    # Case 3a: many damage, none plurality -> pair with largest minority damage
+    dmg_sorted = sorted(dmg_present, key=lambda c: (-counts[c], c))
+    largest_minority = int(dmg_sorted[0])
+    a, b = sorted((plur_nondmg, largest_minority))
+    return "ABSTAIN", (a, b)
+
+
+def transfer_labels_1cm_to_4cm(
+    prob_1cm_path,
+    ref_4cm_path,
+    out_label_path,
+    out_abstain_path,
+    out_superpixel_path,
+    class_names,                 # cfg.CLASS_NAMES: {id: name}
+    damage_ids,                  # cfg.CLASSES_OF_INTEREST
+    ignore_index=255,
+    write_legend=True,
+):
+    """Project the 1cm labeling (argmax of prob_1cm_path) onto the 4cm grid
+    (defined by ref_4cm_path), writing the 4cm label / abstain / superpixel
+    rasters. Returns a stats dict.
+
+    The abstain raster and its <abstain>_legend.json match build_abstain_raster's
+    coding, and the superpixel raster groups contiguous same-pair abstain cells,
+    so abstain_review.build_abstain_review_polygons() consumes them unchanged.
+    """
+    n_classes = len(class_names)
+    damage_ids = set(int(d) for d in damage_ids)
+    pair_to_code = _pair_codes(n_classes)
+
+    # --- read 1cm probs -> argmax labels
+    with rasterio.open(prob_1cm_path) as src:
+        probs = src.read().astype(np.float32)      # (C, H, W)
+        tr_1cm = src.transform
+    valid_1cm = np.isfinite(probs).all(axis=0) & (probs.sum(axis=0) > 1e-6)
+    labels_1cm = np.where(valid_1cm, probs.argmax(axis=0), ignore_index).astype(np.int32)
+
+    # --- 4cm reference grid
+    with rasterio.open(ref_4cm_path) as ref:
+        H4, W4 = ref.height, ref.width
+        tr_4cm = ref.transform
+        crs_4cm = ref.crs
+        profile = ref.profile.copy()
+
+    # --- gather 1cm labels per 4cm cell (coordinate-based)
+    cell_labels = _blockwise_1cm_labels(
+        labels_1cm, tr_1cm, tr_4cm, (H4, W4), ignore_index)
+
+    label_4cm   = np.full((H4, W4), ignore_index, dtype=np.uint8)
+    abstain_4cm = np.zeros((H4, W4), dtype=np.uint8)   # 0 = not abstain
+    pairid_4cm  = np.full((H4, W4), -1, dtype=np.int32)  # temp: which pair, for grouping
+
+    n_assigned = 0
+    n_abstain = 0
+    for (r, c), block in cell_labels.items():
+        block = block[block != ignore_index]
+        if block.size == 0:
+            continue
+        label, pair = _decide_cell(block, damage_ids, n_classes)
+        if label == "ABSTAIN":
+            code = pair_to_code[pair]
+            abstain_4cm[r, c] = code
+            pairid_4cm[r, c] = code
+            label_4cm[r, c] = ignore_index   # abstain stays unlabeled until reviewed
+            n_abstain += 1
+        else:
+            label_4cm[r, c] = label
+            n_assigned += 1
+
+    # --- superpixel raster: contiguous cells sharing the SAME pair code = one id
+    superpix = np.zeros((H4, W4), dtype=np.int32)
+    next_id = 1
+    struct = ndimage.generate_binary_structure(2, 1)  # 4-connectivity
+    for code in np.unique(pairid_4cm[pairid_4cm > 0]):
+        mask = pairid_4cm == code
+        lbl, n = ndimage.label(mask, structure=struct)
+        for k in range(1, n + 1):
+            superpix[lbl == k] = next_id
+            next_id += 1
+
+    # --- write rasters
+    def _write(path, arr, dtype, nodata):
+        p = profile.copy()
+        p.update(count=1, dtype=dtype, compress="lzw", nodata=nodata)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with rasterio.open(path, "w", **p) as dst:
+            dst.write(arr.astype(dtype), 1)
+
+    _write(out_label_path, label_4cm, "uint8", ignore_index)
+    _write(out_abstain_path, abstain_4cm, "uint8", 0)
+    _write(out_superpixel_path, superpix, "int32", 0)
+
+    # --- legend matching build_abstain_raster (<abstain>_legend.json)
+    if write_legend:
+        legend = {}
+        for (a, b), code in pair_to_code.items():
+            legend[str(code)] = [class_names.get(a, f"class_{a}"),
+                                 class_names.get(b, f"class_{b}")]
+        legend_path = os.path.splitext(out_abstain_path)[0] + "_legend.json"
+        with open(legend_path, "w") as f:
+            json.dump(legend, f, indent=2)
+
+    stats = {
+        "cells_assigned": n_assigned,
+        "cells_abstain": n_abstain,
+        "superpixels": int(next_id - 1),
+        "coverage_cells": len(cell_labels),
+        "grid_4cm": [H4, W4],
+    }
+    print(f"transfer: {n_assigned} assigned, {n_abstain} abstain, "
+          f"{stats['superpixels']} review superpixels over {H4}×{W4} 4cm grid")
+    return stats
