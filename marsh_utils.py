@@ -4350,3 +4350,96 @@ def transfer_labels_1cm_to_4cm(
     print(f"transfer: {n_assigned} assigned, {n_abstain} abstain, "
           f"{stats['superpixels']} review superpixels over {H4}×{W4} 4cm grid")
     return stats
+
+# Add to marsh_utils.py  (companion to transfer_labels_1cm_to_4cm)
+#
+# Fold the labeler-resolved abstain labels back into the 4cm label raster,
+# producing the final trainable Model-2 label raster.
+#
+# After transfer_labels_1cm_to_4cm, the 4cm label raster has:
+#   0..n-1   confidently assigned classes
+#   255      abstained (pending review)  OR  uncovered (no 1cm labeling)
+# The labeler resolves the abstained superpixels; export_gt.py writes them as
+# polygons tagged with class_id (and superpixel_id). This function rasterizes
+# those settled polygons onto the 4cm grid and fills them in, leaving genuinely
+# uncovered/unresolved cells as ignore_index for training.
+
+import numpy as np
+import rasterio
+from rasterio.features import rasterize
+import geopandas as gpd
+
+
+def merge_resolved_labels_4cm(
+    label_4cm_path,
+    settled_gt_path,             # export_gt.py output (GeoPackage/shapefile)
+    out_final_path,
+    class_field="class_id",      # integer model-0-indexed class column in the GT
+    ignore_index=255,
+    only_fill_ignore=True,       # only write into currently-ignored (255) cells
+    gt_layer=None,               # layer name if the GT is a multi-layer GPKG
+):
+    """Rasterize settled GT polygons onto the 4cm grid and merge into the label
+    raster, producing the final trainable raster.
+
+    only_fill_ignore=True (default): resolved labels are written ONLY where the
+    current raster is ignore_index (the abstained cells), so confidently assigned
+    cells are never overwritten. Set False to let GT override everything (e.g. if
+    a human correction should trump a transferred label).
+
+    Cells that remain ignore_index after the merge (uncovered, or abstains the
+    labeler didn't settle) stay excluded from training. Returns a stats dict.
+    """
+    with rasterio.open(label_4cm_path) as src:
+        label = src.read(1)
+        transform = src.transform
+        crs = src.crs
+        profile = src.profile.copy()
+        H, W = src.height, src.width
+
+    gdf = gpd.read_file(settled_gt_path, layer=gt_layer) if gt_layer \
+        else gpd.read_file(settled_gt_path)
+    if gdf.empty:
+        print("no settled GT polygons; writing label raster unchanged")
+        _write(out_final_path, label, profile, ignore_index)
+        return {"resolved_cells": 0, "remaining_ignore": int((label == ignore_index).sum())}
+
+    # Reproject GT to the raster CRS if needed
+    if gdf.crs is not None and crs is not None and gdf.crs != crs:
+        gdf = gdf.to_crs(crs)
+
+    if class_field not in gdf.columns:
+        raise ValueError(f"{class_field!r} not in GT columns: {list(gdf.columns)}")
+
+    # Rasterize settled polygons -> a class raster (ignore_index where no polygon)
+    shapes = ((geom, int(cls)) for geom, cls in
+              zip(gdf.geometry, gdf[class_field]) if geom is not None and not geom.is_empty)
+    resolved = rasterize(
+        shapes, out_shape=(H, W), transform=transform,
+        fill=ignore_index, dtype="int32",
+    )
+
+    final = label.astype(np.int32).copy()
+    has_resolved = resolved != ignore_index
+    if only_fill_ignore:
+        fill_mask = has_resolved & (final == ignore_index)
+    else:
+        fill_mask = has_resolved
+    final[fill_mask] = resolved[fill_mask]
+
+    n_resolved = int(fill_mask.sum())
+    remaining = int((final == ignore_index).sum())
+    _write(out_final_path, final.astype(label.dtype), profile, ignore_index)
+
+    print(f"merged {n_resolved} resolved cell(s); {remaining} cell(s) remain "
+          f"ignore ({'uncovered or unsettled' if remaining else 'none'})")
+    return {"resolved_cells": n_resolved, "remaining_ignore": remaining}
+
+
+def _write(path, arr, profile, nodata):
+    import os
+    p = profile.copy()
+    p.update(count=1, dtype=str(arr.dtype), compress="lzw", nodata=nodata)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with rasterio.open(path, "w", **p) as dst:
+        dst.write(arr, 1)
