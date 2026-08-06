@@ -4020,7 +4020,6 @@ Output contract (what load_regions expects):
 
 Deps: rasterio, shapely, pyproj  (already in a typical geospatial notebook).
 """
-from __future__ import annotations
 
 import json
 import numpy as np
