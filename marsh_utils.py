@@ -4157,14 +4157,6 @@ from scipy import ndimage
 ABSTAIN_IGNORE = 255   # 4cm cells with no 1cm coverage / ignored
 
 
-def _pair_codes(n_classes):
-    """MIRROR of abstain._pair_codes / abstain_review._code_to_pair:
-    unordered pairs in itertools.combinations(range(n_classes), 2) order,
-    code = k+1. Returns {(a,b): code} with a < b."""
-    return {pair: k + 1 for k, pair in
-            enumerate(itertools.combinations(range(n_classes), 2))}
-
-
 def _blockwise_1cm_labels(labels_1cm, tr_1cm, tr_4cm, shape_4cm, ignore_index):
     """For each 4cm cell, collect the 1cm label values whose pixel centres fall
     inside that cell. Returns a dict: (row4, col4) -> np.array of 1cm labels.
