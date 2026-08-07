@@ -4433,3 +4433,217 @@ def _write(path, arr, profile, nodata):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with rasterio.open(path, "w", **p) as dst:
         dst.write(arr, 1)
+
+# Add to marsh_utils.py
+#
+# Model-2 patch extractor: identical to build_patches_with_splits_multi, except
+# the per-patch label mask is READ from a label raster (label_4cm_combined.tif,
+# already on the reference grid) instead of rasterized from polygons. Used when
+# labels come from the 1cm->4cm transfer rather than a polygon GeoPackage.
+
+from contextlib import ExitStack
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from rasterio.vrt import WarpedVRT
+from rasterio.enums import Resampling
+
+
+def build_patches_with_splits_raster(paths, label_raster_path, cfg,
+                                     resampling=Resampling.bilinear):
+    """Like build_patches_with_splits_multi, but labels come from a raster.
+
+    label_raster_path : single-band label raster (classes 0..n-1, ignore_value
+        elsewhere) aligned to the reference grid (first band_spec raster). For
+        Model 2 this is the combined transfer+handlabel raster. Label windows are
+        read with nearest-neighbour resampling so class ids are never interpolated.
+    """
+    band_spec     = cfg.BAND_SPEC
+    patch_size    = cfg.PATCH_SIZE
+    overlap       = cfg.OVERLAP
+    block_size_m  = cfg.BLOCK_SIZE_M
+    train_frac    = cfg.TRAIN_FRAC
+    val_frac      = cfg.VAL_FRAC
+    seed          = cfg.SEED
+    require_labels = cfg.REQUIRE_LABELS
+    ignore_value  = cfg.IGNORE_INDEX
+
+    if not band_spec:
+        raise ValueError("band_spec must contain at least one entry")
+
+    stride = max(1, int(patch_size * (1 - overlap)))
+
+    raster_paths_ordered = []
+    for key, _ in band_spec:
+        p = paths[key]
+        if p not in raster_paths_ordered:
+            raster_paths_ordered.append(p)
+    band_spec_resolved = [(paths[key], idx) for key, idx in band_spec]
+
+    with ExitStack() as stack:
+        ref_path = raster_paths_ordered[0]
+        ref_src = stack.enter_context(rasterio.open(ref_path))
+        sources = {ref_path: ref_src}
+
+        for p in raster_paths_ordered[1:]:
+            src = stack.enter_context(rasterio.open(p))
+            if _grids_match(src, ref_src):
+                sources[p] = src
+            else:
+                sources[p] = stack.enter_context(WarpedVRT(
+                    src, crs=ref_src.crs, transform=ref_src.transform,
+                    width=ref_src.width, height=ref_src.height,
+                    resampling=resampling,
+                ))
+
+        # Label raster as an extra source, aligned to the reference grid.
+        # NEAREST so class ids are never blended.
+        lbl_raw = stack.enter_context(rasterio.open(label_raster_path))
+        if _grids_match(lbl_raw, ref_src):
+            lbl_src = lbl_raw
+        else:
+            lbl_src = stack.enter_context(WarpedVRT(
+                lbl_raw, crs=ref_src.crs, transform=ref_src.transform,
+                width=ref_src.width, height=ref_src.height,
+                resampling=Resampling.nearest,
+            ))
+
+        bands_by_path = {}
+        for path, band_idx in band_spec_resolved:
+            bands_by_path.setdefault(path, []).append(band_idx)
+
+        h, w = ref_src.height, ref_src.width
+
+        patch_locations, patch_blocks = [], []
+        for row in range(0, h - patch_size + 1, stride):
+            for col in range(0, w - patch_size + 1, stride):
+                cr, cc = row + patch_size // 2, col + patch_size // 2
+                x_world, y_world = ref_src.xy(cr, cc)
+                block = get_block_id(x_world, y_world, block_size_m)
+                patch_locations.append((row, col))
+                patch_blocks.append(block)
+
+        block_to_split = assign_blocks_to_splits(
+            patch_blocks, train_frac, val_frac, seed)
+
+        for (row, col), block in zip(patch_locations, patch_blocks):
+            window = Window(col, row, patch_size, patch_size)
+            window_transform = ref_src.window_transform(window)
+
+            arrays_by_key = {}
+            for path, band_indices in bands_by_path.items():
+                src = sources[path]
+                arr = src.read(band_indices, window=window)
+                for i, b in enumerate(band_indices):
+                    arrays_by_key[(path, b)] = arr[i]
+            image = np.stack(
+                [arrays_by_key[(path, b)] for path, b in band_spec_resolved], axis=0)
+
+            # Label mask: read this window straight from the label raster
+            mask = lbl_src.read(1, window=window).astype(np.uint8)
+
+            labeled_fraction = float((mask != ignore_value).mean())
+            if require_labels and labeled_fraction == 0:
+                continue
+
+            yield {
+                'image': image,
+                'mask': mask,
+                'window': window,
+                'transform': window_transform,
+                'labeled_fraction': labeled_fraction,
+                'split': block_to_split[block],
+                'block_id': block,
+            }
+
+# Add to marsh_utils.py
+#
+# Build the Model-2 training label raster: the 1cm->4cm transfer output, with the
+# optional 'other' hand-labels burned into still-unlabeled cells. Hand-labels only
+# fill ignore_index cells, so they never overwrite the transfer's confident labels.
+# Tolerates an empty / missing hand-label layer.
+
+import os
+import numpy as np
+import rasterio
+from rasterio.features import rasterize
+import geopandas as gpd
+
+
+def build_model2_labels(
+    transfer_label_path,          # label_4cm.tif from transfer_labels_1cm_to_4cm
+    out_path,
+    handlabels_path=None,         # e.g. other_handlabels.shp ; None/missing is fine
+    hand_class=0,                 # class id the hand-labels represent ('other')
+    class_field=None,             # if set, read per-polygon class from this column
+                                  # instead of using hand_class for all
+    qgis_to_model=None,           # optional {qgis_id: model_id} if class_field is QGIS-indexed
+    ignore_index=255,
+):
+    """Return path to the combined Model-2 label raster.
+
+    transfer labels are kept as-is; hand-labels fill only ignore_index cells.
+    If handlabels_path is None, missing, or empty, the transfer raster is copied
+    through unchanged.
+    """
+    with rasterio.open(transfer_label_path) as src:
+        label = src.read(1)
+        transform = src.transform
+        crs = src.crs
+        profile = src.profile.copy()
+        H, W = src.height, src.width
+
+    n_hand = 0
+    if handlabels_path and os.path.exists(handlabels_path):
+        gdf = gpd.read_file(handlabels_path)
+        if not gdf.empty:
+            if gdf.crs is not None and crs is not None and gdf.crs != crs:
+                gdf = gdf.to_crs(crs)
+
+            def _cls(row):
+                if class_field and class_field in gdf.columns:
+                    c = int(row[class_field])
+                    if qgis_to_model:
+                        c = qgis_to_model.get(c, qgis_to_model.get(str(c), c))
+                    return c
+                return hand_class
+
+            shapes = ((geom, _cls(row)) for geom, (_, row) in
+                      zip(gdf.geometry, gdf.iterrows())
+                      if geom is not None and not geom.is_empty)
+            burned = rasterize(shapes, out_shape=(H, W), transform=transform,
+                               fill=ignore_index, dtype="int32")
+
+            # Conflicts: a hand-label wants a cell the transfer already labeled
+            # with a DIFFERENT class. Transfer wins, but warn -- this can signal a
+            # hand-labeling mistake (e.g. 'other' drawn over real damage).
+            has_hand = burned != ignore_index
+            already  = label != ignore_index
+            conflict = has_hand & already & (burned != label.astype(burned.dtype))
+            n_conflict = int(conflict.sum())
+            if n_conflict:
+                # summarize which transfer-classes got overlaid, for a useful message
+                lost = label[conflict]
+                uniq, cnts = np.unique(lost, return_counts=True)
+                brk = ", ".join(f"class {int(u)}: {int(c)}" for u, c in zip(uniq, cnts))
+                print(f"  WARNING: {n_conflict} hand-label cell(s) overlap "
+                      f"transfer labels of a different class (transfer wins). "
+                      f"Overlaid transfer classes -> {brk}. "
+                      f"Check hand-labeling directions if this is unexpected.")
+
+            fill = has_hand & (label == ignore_index)
+            label = label.copy()
+            label[fill] = burned[fill].astype(label.dtype)
+            n_hand = int(fill.sum())
+
+    p = profile.copy()
+    p.update(count=1, dtype=str(label.dtype), compress="lzw", nodata=ignore_index)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with rasterio.open(out_path, "w", **p) as dst:
+        dst.write(label, 1)
+
+    n_labeled = int((label != ignore_index).sum())
+    print(f"model2 labels: {n_labeled} labeled cell(s) "
+          f"({n_hand} from hand-labels) -> {out_path}")
+    return out_path
+  
