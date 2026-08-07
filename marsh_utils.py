@@ -4256,7 +4256,7 @@ def transfer_labels_1cm_to_4cm(
     """
     n_classes = len(class_names)
     damage_ids = set(int(d) for d in damage_ids)
-    pair_to_code = _pair_codes(n_classes)
+    pair_to_code, _ = _pair_codes(n_classes)
 
     # --- read 1cm probs -> argmax labels
     with rasterio.open(prob_1cm_path) as src:
