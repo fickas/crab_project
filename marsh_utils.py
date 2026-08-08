@@ -4647,3 +4647,74 @@ def build_model2_labels(
           f"({n_hand} from hand-labels) -> {out_path}")
     return out_path
   
+# Add to marsh_utils.py  (generalizes pick_thresholds)
+#
+# Per-class threshold selection with a choice of objective per class. Covers:
+#   - precision floor  (as pick_thresholds, but per-class value)
+#   - recall floor     (new: catch >= X% of actual class pixels)
+#   - max F1           (new: balance, no target value needed)
+#
+# targets: {class_id: (objective, value)} where objective in
+#          {'precision', 'recall', 'f1'}. value is the floor for
+#          precision/recall; ignored for 'f1'. Classes absent from `targets`
+#          are left out of the returned dict (no threshold set).
+#
+# Selection direction per objective:
+#   precision floor -> LOWEST threshold with precision >= value  (keeps recall up)
+#   recall floor    -> HIGHEST threshold with recall   >= value  (keeps precision up)
+#   f1              -> threshold maximizing F1
+#
+# If a floor is unachievable at any threshold, picks the best-available extreme
+# and warns with the achievable max, so a model limitation is surfaced not hidden.
+
+import numpy as np
+
+
+def pick_thresholds_per_class(pc_results, targets, verbose=True):
+    thresholds = np.asarray(pc_results['thresholds'])          # (T,)
+    precision  = pc_results['precision'].numpy()               # (C, T)
+    recall     = pc_results['recall'].numpy()                  # (C, T)
+
+    out = {}
+    for cls, spec in targets.items():
+        objective, value = (spec if isinstance(spec, (tuple, list))
+                            else (spec, None))
+        p = precision[cls]
+        r = recall[cls]
+
+        if objective == 'precision':
+            ok = np.flatnonzero(p >= value)
+            if ok.size:
+                i = ok[0]                       # lowest threshold meeting floor
+            else:
+                i = int(np.argmax(p))           # best precision available
+                if verbose:
+                    print(f"  WARNING class {cls}: precision {value} unreachable; "
+                          f"best precision={p[i]:.3f} at threshold={thresholds[i]:.2f}")
+
+        elif objective == 'recall':
+            ok = np.flatnonzero(r >= value)
+            if ok.size:
+                i = ok[-1]                      # highest threshold meeting floor
+            else:
+                i = int(np.argmax(r))           # best recall available
+                if verbose:
+                    print(f"  WARNING class {cls}: recall {value} unreachable; "
+                          f"best recall={r[i]:.3f} at threshold={thresholds[i]:.2f}")
+
+        elif objective == 'f1':
+            f1 = np.where((p + r) > 0, 2 * p * r / (p + r), 0.0)
+            i = int(np.argmax(f1))
+
+        else:
+            raise ValueError(f"class {cls}: unknown objective {objective!r} "
+                             f"(use 'precision', 'recall', or 'f1')")
+
+        out[cls] = float(thresholds[i])
+        if verbose:
+            f1_i = (2 * p[i] * r[i] / (p[i] + r[i])) if (p[i] + r[i]) > 0 else 0.0
+            tgt = f"{objective}" + (f"={value}" if value is not None else "")
+            print(f"  class {cls}: threshold={thresholds[i]:.2f}  "
+                  f"precision={p[i]:.3f}  recall={r[i]:.3f}  f1={f1_i:.3f}   [{tgt}]")
+
+    return out
