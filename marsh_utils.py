@@ -4718,3 +4718,126 @@ def pick_thresholds_per_class(pc_results, targets, verbose=True):
                   f"precision={p[i]:.3f}  recall={r[i]:.3f}  f1={f1_i:.3f}   [{tgt}]")
 
     return out
+
+# Add to marsh_utils.py
+#
+# Canonical path builder for the marsh pipeline. The project root IS the marsh
+# (e.g. .../WEL is Wellfleet); a second marsh is a sibling root, not a subdir.
+#
+# Folder convention
+# -----------------
+#   {root}/
+#     flights_1cm/{date}/                 a 1cm flight — always a ROOT (no linkage)
+#       imagery/    pan.tif ms_5band.tif dem_5m.tif pansharp_5band.tif
+#       bands/      ndvi.tif ndre.tif ...         (derived, regenerable)
+#       labels/     handlabels.shp gt_labeled.gpkg
+#       model/      runs/run_<ts>/ best_model.pt  (Model 1 for this flight)
+#       predictions/ full_probs_<ts>.tif
+#       review/     superpixels.tif abstain.tif review.gpkg
+#       experiments/                             (band experiments, ablations — kept, not canonical)
+#
+#     flights_4cm/{date}/                 a 4cm flight — its OWN general info, plus
+#       imagery/ bands/ labels/                   (the 4cm capture itself)
+#       experiments/
+#       linkage/from_1cm_{date}/          everything DERIVED from one 1cm model:
+#         transfer/    label_4cm.tif abstain_4cm.tif superpix_4cm.tif review_4cm.gpkg *_legend.json
+#         labels/      label_combined.tif         (transfer + this flight's handlabels)
+#         model/       runs/run_<ts>/ best_model.pt   (Model 2 from this linkage)
+#         predictions/ full_probs_<ts>.tif
+#         review/      superpixels.tif abstain.tif review.gpkg   (Model 2's own abstains)
+#       (a second linkage/from_1cm_<other>/ coexists cleanly — full provenance)
+#
+#     shared/       marsh-level, flight-independent (site polygon, etc.)
+#     scratch/      disposable temp work — safe to wipe
+#     archive/      legacy dirs moved out of the way
+#
+# The linkage/ subtree mirrors the portal's EvalResult.derived_from: 1cm = root,
+# 4cm = derived-from-a-1cm. Deleting one linkage/from_1cm_<date>/ cleanly removes
+# everything derived from that pairing, leaving the 4cm flight's own data intact.
+
+import os
+
+
+def flight_dir(root, resolution, date):
+    """Directory for one flight. resolution '1cm'/'4cm'; date 'YYYY-MM-DD'."""
+    return os.path.join(root, f"flights_{resolution}", date)
+
+
+def scratch_dir(root):  return os.path.join(root, "scratch")
+def archive_dir(root):  return os.path.join(root, "archive")
+def shared_dir(root):   return os.path.join(root, "shared")
+
+
+def flight_paths(root, resolution, date, from_1cm=None, bands=None):
+    """Build the standard path dict for a flight.
+
+    root       : the marsh project dir, e.g. '.../crab_project/WEL' (WEL = Wellfleet)
+    resolution : '1cm' or '4cm'
+    date       : 'YYYY-MM-DD' (unique within a resolution)
+    from_1cm   : 4cm only — the 1cm flight date whose Model 1 labeled this flight.
+                 Places all derived artifacts under linkage/from_1cm_<date>/.
+                 None for a 1cm flight, or a 4cm flight before any transfer.
+    bands      : optional derived-band stems -> bands/<name>.tif path keys.
+
+    Logical keys ('pan_orthomosaic','ndvi','gt_path','artifacts','transfer_label',
+    'label_raster', ...) match what the notebooks already use, so switching from
+    synthetic to real data is just swapping the paths = line.
+    """
+    base = flight_dir(root, resolution, date)
+
+    p = {
+        "_flight_dir":   base,
+        "_imagery_dir":  os.path.join(base, "imagery"),
+        "_bands_dir":    os.path.join(base, "bands"),
+        "_labels_dir":   os.path.join(base, "labels"),
+        "_experiments_dir": os.path.join(base, "experiments"),
+
+        # the flight's OWN general info
+        "pan_orthomosaic": os.path.join(base, "imagery", "pan.tif"),
+        "pansharp_ms":     os.path.join(base, "imagery", "pansharp_5band.tif"),
+        "ms_5band":        os.path.join(base, "imagery", "ms_5band.tif"),
+        "dem":             os.path.join(base, "imagery", "dem_5m.tif"),
+        "handlabels":      os.path.join(base, "labels", "handlabels.shp"),
+        "gt_path":         os.path.join(base, "labels", "gt_labeled.gpkg"),
+        "channel_stats":   os.path.join(base, "channel_stats.json"),
+    }
+    for name in (bands or []):
+        p[name] = os.path.join(base, "bands", f"{name}.tif")
+
+    if from_1cm is None:
+        # ROOT flight (1cm, or 4cm pre-transfer): model/predictions/review sit
+        # directly under the flight — no linkage grouping.
+        p.update({
+            "_model_dir":       os.path.join(base, "model"),
+            "_predictions_dir": os.path.join(base, "predictions"),
+            "_review_dir":      os.path.join(base, "review"),
+            "artifacts":        os.path.join(base, "model"),
+        })
+    else:
+        # DERIVED: everything from this 1cm source lives under one linkage subtree.
+        link = os.path.join(base, "linkage", f"from_1cm_{from_1cm}")
+        p.update({
+            "_linkage_dir":     link,
+            "_transfer_dir":    os.path.join(link, "transfer"),
+            "_linklabels_dir":  os.path.join(link, "labels"),
+            "_model_dir":       os.path.join(link, "model"),
+            "_predictions_dir": os.path.join(link, "predictions"),
+            "_review_dir":      os.path.join(link, "review"),
+
+            "artifacts":        os.path.join(link, "model"),
+            "transfer_label":   os.path.join(link, "transfer", "label_4cm.tif"),
+            "abstain":          os.path.join(link, "transfer", "abstain_4cm.tif"),
+            "superpixel":       os.path.join(link, "transfer", "superpix_4cm.tif"),
+            "review_gpkg":      os.path.join(link, "transfer", "review_4cm.gpkg"),
+            "label_raster":     os.path.join(link, "labels", "label_combined.tif"),
+        })
+
+    return p
+
+
+def ensure_flight_dirs(paths):
+    """Create the structural directories referenced in a paths dict (idempotent)."""
+    for k, v in paths.items():
+        if k.endswith("_dir"):
+            os.makedirs(v, exist_ok=True)
+    return paths
