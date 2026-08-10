@@ -4728,8 +4728,8 @@ def pick_thresholds_per_class(pc_results, targets, verbose=True):
 # -----------------
 #   {root}/
 #     flights_1cm/{date}/                 a 1cm flight — always a ROOT (no linkage)
-#       source/     <raw flight ortho> dem_5m.tif   (raw inputs / symlinks)
-#       imagery/    pan.tif ms_5band.tif pansharp_5band.tif   (processed)
+#       source/     <raw ortho> <pre-made DEM tif>  (delivered inputs / symlinks)
+#       imagery/    pan.tif ms_5band.tif pansharp_5band.tif   (processed from ortho)
 #       bands/      ndvi.tif ndre.tif ...         (derived, regenerable)
 #       labels/     handlabels.shp gt_labeled.gpkg
 #       model/      runs/run_<ts>/ best_model.pt  (Model 1 for this flight)
@@ -4770,7 +4770,7 @@ def shared_dir(root):   return os.path.join(root, "shared")
 
 
 def flight_paths(root, resolution, date, from_1cm=None, bands=None,
-                 source_ortho_name="ortho.tif"):
+                 source_ortho_name="ortho.tif", source_dem_name="dem.tif"):
     """Build the standard path dict for a flight.
 
     root       : the marsh project dir, e.g. '.../crab_project/WEL' (WEL = Wellfleet)
@@ -4783,6 +4783,8 @@ def flight_paths(root, resolution, date, from_1cm=None, bands=None,
     source_ortho_name : filename of the raw flight ortho placed (or symlinked)
                  under source/. Defaults to 'ortho.tif'; pass the original
                  name (e.g. '18Oct21_WEL_Low_Mica_Ortho.tif') to keep it.
+    source_dem_name  : filename of the pre-made DEM tif (delivered, not derived
+                 here) under source/. Defaults to 'dem.tif'; pass the real name.
 
     Logical keys ('pan_orthomosaic','ndvi','gt_path','artifacts','transfer_label',
     'label_raster', ...) match what the notebooks already use, so switching from
@@ -4806,9 +4808,9 @@ def flight_paths(root, resolution, date, from_1cm=None, bands=None,
         "handlabels":      os.path.join(base, "labels", "handlabels.shp"),
         "gt_path":         os.path.join(base, "labels", "gt_labeled.gpkg"),
         "channel_stats":   os.path.join(base, "channel_stats.json"),
-        # raw flight inputs (before processing into imagery/ and bands/)
+        # raw delivered inputs (arrive as files; processed elsewhere)
         "source_ortho":    os.path.join(base, "source", source_ortho_name),
-        "dem":             os.path.join(base, "source", "dem_5m.tif"),
+        "dem":             os.path.join(base, "source", source_dem_name),
     }
     for name in (bands or []):
         p[name] = os.path.join(base, "bands", f"{name}.tif")
