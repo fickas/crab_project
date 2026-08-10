@@ -4728,7 +4728,8 @@ def pick_thresholds_per_class(pc_results, targets, verbose=True):
 # -----------------
 #   {root}/
 #     flights_1cm/{date}/                 a 1cm flight — always a ROOT (no linkage)
-#       imagery/    pan.tif ms_5band.tif dem_5m.tif pansharp_5band.tif
+#       source/     <raw flight ortho> dem_5m.tif   (raw inputs / symlinks)
+#       imagery/    pan.tif ms_5band.tif pansharp_5band.tif   (processed)
 #       bands/      ndvi.tif ndre.tif ...         (derived, regenerable)
 #       labels/     handlabels.shp gt_labeled.gpkg
 #       model/      runs/run_<ts>/ best_model.pt  (Model 1 for this flight)
@@ -4768,7 +4769,8 @@ def archive_dir(root):  return os.path.join(root, "archive")
 def shared_dir(root):   return os.path.join(root, "shared")
 
 
-def flight_paths(root, resolution, date, from_1cm=None, bands=None):
+def flight_paths(root, resolution, date, from_1cm=None, bands=None,
+                 source_ortho_name="ortho.tif"):
     """Build the standard path dict for a flight.
 
     root       : the marsh project dir, e.g. '.../crab_project/WEL' (WEL = Wellfleet)
@@ -4778,6 +4780,9 @@ def flight_paths(root, resolution, date, from_1cm=None, bands=None):
                  Places all derived artifacts under linkage/from_1cm_<date>/.
                  None for a 1cm flight, or a 4cm flight before any transfer.
     bands      : optional derived-band stems -> bands/<name>.tif path keys.
+    source_ortho_name : filename of the raw flight ortho placed (or symlinked)
+                 under source/. Defaults to 'ortho.tif'; pass the original
+                 name (e.g. '18Oct21_WEL_Low_Mica_Ortho.tif') to keep it.
 
     Logical keys ('pan_orthomosaic','ndvi','gt_path','artifacts','transfer_label',
     'label_raster', ...) match what the notebooks already use, so switching from
@@ -4791,6 +4796,7 @@ def flight_paths(root, resolution, date, from_1cm=None, bands=None):
         "_bands_dir":    os.path.join(base, "bands"),
         "_labels_dir":   os.path.join(base, "labels"),
         "_experiments_dir": os.path.join(base, "experiments"),
+        "_source_dir":   os.path.join(base, "source"),
 
         # the flight's OWN general info
         "pan_orthomosaic": os.path.join(base, "imagery", "pan.tif"),
@@ -4800,6 +4806,9 @@ def flight_paths(root, resolution, date, from_1cm=None, bands=None):
         "handlabels":      os.path.join(base, "labels", "handlabels.shp"),
         "gt_path":         os.path.join(base, "labels", "gt_labeled.gpkg"),
         "channel_stats":   os.path.join(base, "channel_stats.json"),
+        # raw flight inputs (before processing into imagery/ and bands/)
+        "source_ortho":    os.path.join(base, "source", source_ortho_name),
+        "dem":             os.path.join(base, "source", "dem_5m.tif"),
     }
     for name in (bands or []):
         p[name] = os.path.join(base, "bands", f"{name}.tif")
