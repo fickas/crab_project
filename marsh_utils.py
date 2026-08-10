@@ -4823,6 +4823,7 @@ def flight_paths(root, resolution, date, from_1cm=None, bands=None,
             "_predictions_dir": os.path.join(base, "predictions"),
             "_review_dir":      os.path.join(base, "review"),
             "artifacts":        os.path.join(base, "model"),
+            "runs_dir":         os.path.join(base, "model", "runs"),
         })
     else:
         # DERIVED: everything from this 1cm source lives under one linkage subtree.
@@ -4836,6 +4837,7 @@ def flight_paths(root, resolution, date, from_1cm=None, bands=None,
             "_review_dir":      os.path.join(link, "review"),
 
             "artifacts":        os.path.join(link, "model"),
+            "runs_dir":         os.path.join(link, "model", "runs"),
             "transfer_label":   os.path.join(link, "transfer", "label_4cm.tif"),
             "abstain":          os.path.join(link, "transfer", "abstain_4cm.tif"),
             "superpixel":       os.path.join(link, "transfer", "superpix_4cm.tif"),
