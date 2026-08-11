@@ -256,7 +256,7 @@ EXAMPLE_EXPERIMENTS = [
             ('tpi_small', 1),
         ],
         'setup': [
-            ('ensure_tpi', {'dem_key': 'dem_high_res',
+            ('ensure_tpi', {'dem_key': 'dem',
                             'neighborhood_m': 0.3, 'out_key': 'tpi_small'}),
         ],
     },
@@ -269,9 +269,9 @@ EXAMPLE_EXPERIMENTS = [
             ('tpi_large', 1),
         ],
         'setup': [
-            ('ensure_tpi', {'dem_key': 'dem_high_res',
+            ('ensure_tpi', {'dem_key': 'dem',
                             'neighborhood_m': 0.3, 'out_key': 'tpi_small'}),
-            ('ensure_tpi', {'dem_key': 'dem_high_res',
+            ('ensure_tpi', {'dem_key': 'dem',
                             'neighborhood_m': 2.0, 'out_key': 'tpi_large'}),
         ],
     },
@@ -285,7 +285,7 @@ EXAMPLE_EXPERIMENTS = [
         ],
         'setup': [
             ('ensure_savi', {'ms_key': 'pansharp_ms'}),
-            ('ensure_tpi',  {'dem_key': 'dem_high_res',
+            ('ensure_tpi',  {'dem_key': 'dem',
                              'neighborhood_m': 0.3, 'out_key': 'tpi_small'}),
             ('ensure_ndwi', {'ms_key': 'pansharp_ms'}),
             ('ensure_channel_mask_from_ndwi', {'ndwi_key': 'ndwi'}),
