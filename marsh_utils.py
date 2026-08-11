@@ -4931,3 +4931,80 @@ def pick_run(paths, match):
         raise FileNotFoundError(f"no run matching {match!r} under {paths['runs_dir']}")
     raise ValueError(f"{len(hits)} runs match {match!r}; be more specific: "
                      + ", ".join(os.path.basename(h) for h in hits))
+
+# Add to marsh_utils.py
+#
+# Run discovery helpers — list/select training runs under a flight's model/runs/
+# without hand-decoding timestamps. A run dir is .../model/runs/run_<timestamp>/
+# containing config.json (with training_summary) + model.pt.
+
+import os
+import glob
+import json
+
+
+def list_runs(paths, verbose=True):
+    """List training runs under paths['runs_dir'], newest first, with their
+    val mIoU and key summary fields read from each run's config.json.
+
+    Returns a list of dicts: {dir, name, best_val_miou, evaluated_at, ...},
+    sorted newest-first by directory name (timestamps sort chronologically).
+    """
+    runs_root = paths['runs_dir']
+    if not os.path.isdir(runs_root):
+        if verbose:
+            print(f"(no runs dir yet at {runs_root})")
+        return []
+
+    run_dirs = sorted(glob.glob(os.path.join(runs_root, "run_*")), reverse=True)
+    rows = []
+    for d in run_dirs:
+        summary = {}
+        cfg_path = os.path.join(d, "config.json")
+        if os.path.exists(cfg_path):
+            try:
+                bundle = json.load(open(cfg_path))
+                summary = bundle.get("training_summary", {})
+            except Exception:
+                pass
+        rows.append({
+            "dir":   d,
+            "name":  os.path.basename(d),
+            "best_val_miou":  summary.get("best_val_miou"),
+            "evaluated_at":   summary.get("evaluated_at"),
+            "num_train_patches": summary.get("num_train_patches"),
+            "has_model": os.path.exists(os.path.join(d, "model.pt")),
+        })
+
+    if verbose:
+        if not rows:
+            print(f"(no runs found under {runs_root})")
+        else:
+            print(f"Runs under {runs_root} (newest first):")
+            for i, r in enumerate(rows):
+                miou = f"{r['best_val_miou']:.4f}" if isinstance(r['best_val_miou'], (int, float)) else "  ?  "
+                flag = "" if r["has_model"] else "  [no model.pt!]"
+                print(f"  [{i}] {r['name']}   val_mIoU={miou}   "
+                      f"patches={r['num_train_patches']}{flag}")
+    return rows
+
+
+def latest_run(paths):
+    """Return the newest run directory path (by timestamp). Raises if none."""
+    rows = list_runs(paths, verbose=False)
+    if not rows:
+        raise FileNotFoundError(f"no runs under {paths['runs_dir']}")
+    return rows[0]["dir"]
+
+
+def pick_run(paths, match):
+    """Return the run dir whose name contains `match` (e.g. a timestamp fragment
+    '2026-06-22_17-21-58' or an index-free substring). Raises if 0 or >1 match."""
+    rows = list_runs(paths, verbose=False)
+    hits = [r["dir"] for r in rows if match in r["name"]]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise FileNotFoundError(f"no run matching {match!r} under {paths['runs_dir']}")
+    raise ValueError(f"{len(hits)} runs match {match!r}; be more specific: "
+                     + ", ".join(os.path.basename(h) for h in hits))
