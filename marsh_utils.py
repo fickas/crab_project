@@ -75,6 +75,106 @@ PRIORITY = [5, 4, 3, 2, 1, 0]
 
 IGNORE_INDEX = 255
 
+# Add to marsh_utils.py
+#
+# Shared config: BaseConfig holds the project-wide DEFAULTS (class scheme +
+# canonical hyperparameters). make_config(**overrides) returns a fresh config
+# CLASS (so Config.ATTR access is unchanged) with overrides applied — this is how
+# every notebook gets its Config, and how you experiment: canonical training is
+# make_config() with no overrides; a learning-rate experiment is
+# make_config(LEARNING_RATE=3e-4) and produces a normal run whose config.json
+# records the override. Vary settings without editing shared code.
+#
+# Notebook-local bindings (paths, synthetic-dependent values, batch size) are NOT
+# in BaseConfig — pass them as overrides in the notebook, e.g.:
+#     Config = mu.make_config(
+#         BAND_SPEC=[('pan_orthomosaic',1),('ndvi',1),('ndre',1)],
+#         BLOCK_SIZE_M=3,          # synthetic; use 100 for real
+#         BATCH_SIZE=8,
+#         GT_PATH=paths['gt_path'],
+#         GT_LAYER='ground_truth',
+#     )
+
+
+class BaseConfig:
+    # ── Class scheme (project-wide; pulled from module-level constants) ──
+    ORIGINAL_CLASS_COLUMN = 'Class'
+    CLASS_COLUMN          = 'class_id'
+    CLASS_NAMES           = CLASS_NAMES          # module-level dict
+    CLASSES               = CLASSES
+    CLASSES_OF_INTEREST   = CLASSES_OF_INTEREST
+    PRIORITY              = PRIORITY
+    IGNORE_INDEX          = IGNORE_INDEX
+    QGIS_TO_MODEL         = QGIS_TO_MODEL
+    N_CLASSES             = len(CLASS_NAMES)
+    SEED                  = SEED
+
+    # ── Canonical hyperparameters (defaults; override per run to experiment) ──
+    RESOLUTION_CM   = 1.0
+    BAND_SPEC       = [('pan_orthomosaic', 1), ('ndvi', 1), ('ndre', 1)]
+    PATCH_SIZE      = 512
+    OVERLAP         = 0.5
+    BATCH_SIZE      = 8
+    EPOCHS          = 100
+    LEARNING_RATE   = 1e-4
+    WEIGHT_DECAY    = 1e-4
+    NUM_WORKERS     = 4
+    CE_WEIGHT       = 1.0
+    DICE_WEIGHT     = 1.0
+    USE_D4_AUGMENTATION = True
+    ENCODER         = 'efficientnet-b3'
+    ENCODER_WEIGHTS = 'imagenet'
+    BLOCK_SIZE_M    = 100          # real-data default; override to 3 for synthetic strip
+    TRAIN_FRAC      = 0.7
+    VAL_FRAC        = 0.15
+    TEST_FRAC       = 0.15
+    REQUIRE_LABELS  = True
+
+    # ── Populated post-training (pick_thresholds_per_class, etc.) ──
+    CONFIDENCE_THRESHOLDS = None
+
+    # ── Notebook-local (no shared default; set as overrides in the notebook) ──
+    # GT_PATH, GT_LAYER — depend on paths; pass them to make_config(...)
+
+
+# fields that are the tunable knobs (what an experiment varies) — used by
+# config_overrides() and list_runs to show what differs from the defaults.
+TUNABLE_FIELDS = [
+    'RESOLUTION_CM', 'BAND_SPEC', 'PATCH_SIZE', 'OVERLAP', 'BATCH_SIZE',
+    'EPOCHS', 'LEARNING_RATE', 'WEIGHT_DECAY', 'CE_WEIGHT', 'DICE_WEIGHT',
+    'USE_D4_AUGMENTATION', 'ENCODER', 'ENCODER_WEIGHTS', 'BLOCK_SIZE_M',
+    'TRAIN_FRAC', 'VAL_FRAC', 'TEST_FRAC',
+]
+
+
+def make_config(**overrides):
+    """Return a fresh config CLASS: a copy of BaseConfig with `overrides` applied.
+
+    Access attributes as Config.EPOCHS (class attributes), same as before.
+    Use for every run: make_config() for canonical defaults, or
+    make_config(LEARNING_RATE=3e-4, BAND_SPEC=[...]) to experiment. Unknown keys
+    are allowed (e.g. GT_PATH/GT_LAYER, which aren't in BaseConfig) so notebooks
+    can attach their local bindings.
+    """
+    # start from BaseConfig's attributes
+    attrs = {k: getattr(BaseConfig, k) for k in dir(BaseConfig)
+             if not k.startswith('__')}
+    attrs.update(overrides)
+    Config = type('Config', (), attrs)
+    return Config
+
+
+def config_overrides(cfg, base=BaseConfig):
+    """Return {field: value} for tunable fields where cfg differs from BaseConfig.
+    Used to show, at a glance, what a run changed from the defaults."""
+    out = {}
+    for f in TUNABLE_FIELDS:
+        cv = getattr(cfg, f, None)
+        bv = getattr(base, f, None)
+        if cv != bv:
+            out[f] = cv
+    return out
+
 # Per-class spectral signatures used by the synthetic data generator.
 # Order: Blue (475nm), Green (560nm), Red (668nm), RedEdge (717nm), NIR (842nm).
 # Values are reflectance in [0, 1], chosen to make NDVI/NDRE differentiable
@@ -4943,54 +5043,89 @@ import glob
 import json
 
 
-def list_runs(paths, verbose=True):
-    """List training runs under paths['runs_dir'], newest first, with their
-    val mIoU and key summary fields read from each run's config.json.
+# Add to marsh_utils.py  (run discovery + comparison)
+#
+# A run dir is .../model/runs/run_<timestamp>/ with config.json (config +
+# training_summary) and model.pt. list_runs shows each run's val metric AND how
+# its config differed from BaseConfig, so comparing runs across settings (learning
+# rate, encoder, bands) is just reading this table. Defensive: shows whatever
+# fields exist, so it still lists runs from a future non-U-Net model family.
 
-    Returns a list of dicts: {dir, name, best_val_miou, evaluated_at, ...},
-    sorted newest-first by directory name (timestamps sort chronologically).
-    """
+import os
+import glob
+import json
+
+
+def _load_bundle(run_dir):
+    p = os.path.join(run_dir, "config.json")
+    if not os.path.exists(p):
+        return {}
+    try:
+        return json.load(open(p))
+    except Exception:
+        return {}
+
+
+def list_runs(paths, show_overrides=True, verbose=True):
+    """List runs under paths['runs_dir'], newest first, with val metric and the
+    config fields that differ from BaseConfig. Returns a list of dicts."""
     runs_root = paths['runs_dir']
     if not os.path.isdir(runs_root):
         if verbose:
             print(f"(no runs dir yet at {runs_root})")
         return []
 
+    # tunable fields, if BaseConfig is available in this module
+    base = globals().get('BaseConfig')
+    tunable = globals().get('TUNABLE_FIELDS', [])
+
     run_dirs = sorted(glob.glob(os.path.join(runs_root, "run_*")), reverse=True)
     rows = []
     for d in run_dirs:
-        summary = {}
-        cfg_path = os.path.join(d, "config.json")
-        if os.path.exists(cfg_path):
-            try:
-                bundle = json.load(open(cfg_path))
-                summary = bundle.get("training_summary", {})
-            except Exception:
-                pass
+        bundle = _load_bundle(d)
+        summary = bundle.get("training_summary", {})
+        cfg = bundle.get("config", {})
+        # overrides vs base (defensive: only compare fields that exist in cfg)
+        overrides = {}
+        if base is not None and cfg:
+            for f in tunable:
+                if f in cfg and getattr(base, f, None) != cfg[f]:
+                    overrides[f] = cfg[f]
         rows.append({
-            "dir":   d,
-            "name":  os.path.basename(d),
-            "best_val_miou":  summary.get("best_val_miou"),
-            "evaluated_at":   summary.get("evaluated_at"),
-            "num_train_patches": summary.get("num_train_patches"),
+            "dir": d, "name": os.path.basename(d),
+            "best_val_miou": summary.get("best_val_miou"),
+            "evaluated_at": summary.get("evaluated_at"),
+            "overrides": overrides,
             "has_model": os.path.exists(os.path.join(d, "model.pt")),
         })
 
     if verbose:
         if not rows:
-            print(f"(no runs found under {runs_root})")
+            print(f"(no runs under {runs_root})")
         else:
             print(f"Runs under {runs_root} (newest first):")
             for i, r in enumerate(rows):
-                miou = f"{r['best_val_miou']:.4f}" if isinstance(r['best_val_miou'], (int, float)) else "  ?  "
+                miou = (f"{r['best_val_miou']:.4f}"
+                        if isinstance(r['best_val_miou'], (int, float)) else "  ?  ")
                 flag = "" if r["has_model"] else "  [no model.pt!]"
-                print(f"  [{i}] {r['name']}   val_mIoU={miou}   "
-                      f"patches={r['num_train_patches']}{flag}")
+                line = f"  [{i}] {r['name']}   val_mIoU={miou}"
+                if show_overrides and r["overrides"]:
+                    diffs = ", ".join(f"{k}={_short(v)}" for k, v in r["overrides"].items())
+                    line += f"   ({diffs})"
+                elif show_overrides:
+                    line += "   (defaults)"
+                print(line + flag)
     return rows
 
 
+def _short(v):
+    """Compact repr for the run table (e.g. BAND_SPEC -> band count)."""
+    if isinstance(v, list) and v and isinstance(v[0], (list, tuple)):
+        return f"[{len(v)} bands]"
+    return repr(v)
+
+
 def latest_run(paths):
-    """Return the newest run directory path (by timestamp). Raises if none."""
     rows = list_runs(paths, verbose=False)
     if not rows:
         raise FileNotFoundError(f"no runs under {paths['runs_dir']}")
@@ -4998,13 +5133,11 @@ def latest_run(paths):
 
 
 def pick_run(paths, match):
-    """Return the run dir whose name contains `match` (e.g. a timestamp fragment
-    '2026-06-22_17-21-58' or an index-free substring). Raises if 0 or >1 match."""
     rows = list_runs(paths, verbose=False)
     hits = [r["dir"] for r in rows if match in r["name"]]
     if len(hits) == 1:
         return hits[0]
     if not hits:
         raise FileNotFoundError(f"no run matching {match!r} under {paths['runs_dir']}")
-    raise ValueError(f"{len(hits)} runs match {match!r}; be more specific: "
+    raise ValueError(f"{len(hits)} runs match {match!r}: "
                      + ", ".join(os.path.basename(h) for h in hits))
