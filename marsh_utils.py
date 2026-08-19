@@ -1057,7 +1057,9 @@ def ensure_laplacian(paths, src_key='pan_orthomosaic', band=1, out_key='laplacia
     return _ensure_one(paths, src_key, out_key, 'laplacian.tif',
                        compute_laplacian_raster, band=band)
 
-
+def ensure_local_range(paths, src_key='pan_orthomosaic', window_m=0.3, out_key='local_range'):
+    return _ensure_one(paths, src_key, out_key, f'{out_key}.tif',
+                       compute_local_range, window_m=window_m)
 # ============================================================================
 # Aggregate convenience
 # ============================================================================
