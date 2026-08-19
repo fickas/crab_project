@@ -733,7 +733,6 @@ def compute_hillshade_raster(dem_path, out_path, azimuth_deg=315.0, altitude_deg
     windowed_neighborhood(dem_path, out_path, focal, radius_px=1,
                           dtype="uint8", nodata=0, skip_if_exists=False, label="hillshade")
 
-
 # ============================================================================
 # Channel-dependent bands (require a binary channel mask raster)
 # ============================================================================
@@ -5219,3 +5218,23 @@ def compute_tpi_raster(dem_path, out_path, neighborhood_m=2.0):
 
     windowed_neighborhood(dem_path, out_path, focal, radius_px,
                           label=f"TPI({neighborhood_m}m)")
+
+
+def global_nanmean(src_path, band=1, tile=2048):
+    """Memory-safe global nanmean over a large raster (running sum/count by tile).
+    Used as the fixed NaN-fill for focal ops so tiled results match whole-raster."""
+    total = 0.0
+    count = 0
+    with rasterio.open(src_path) as src:
+        src_nodata = src.nodata
+        for row in range(0, src.height, tile):
+            for col in range(0, src.width, tile):
+                h = min(tile, src.height - row); w = min(tile, src.width - col)
+                a = src.read(band, window=Window(col, row, w, h)).astype("float64")
+                if src_nodata is not None:
+                    a = a[a != src_nodata]
+                else:
+                    a = a[~np.isnan(a)]
+                total += a.sum(); count += a.size
+    return (total / count) if count else 0.0
+
