@@ -824,125 +824,145 @@ def compute_relative_elevation_raster(dem_path, channel_mask_path, out_path):
 
 
 # ============================================================================
-# Texture / structure bands (from pan or any single-band raster)
+# Texture / structure bands — WINDOWED (haloed) versions.
+# All fixed-window focal ops -> windowed_neighborhood. Adds consistent nodata
+# handling (the original local_range/local_entropy ignored nodata, which shows
+# up as garbage on real orthos with a 65535 border).
+#   local_std   : uniform_filter mean/sqmean  -> halo = window//2, NaN-aware (fill-independent)
+#   laplacian   : ndimage.laplace (3x3)        -> halo = 1, global-mean fill
+#   local_range : max_filter - min_filter      -> halo = window//2, NaN-aware
+#   local_entropy: binned uniform_filter       -> halo = window//2, needs global vmin/vmax
+# Requires windowed_neighborhood, global_nanmean in marsh_utils.
 # ============================================================================
+
+
 def compute_local_std_raster(src_path, out_path, band=1, window_m=0.3):
-    """Local standard deviation in a window (texture).
-    Distinguishes mud / wrack / bare from short Spartina even when mean
-    reflectance is similar. window_m is the window edge length in meters."""
+    """Local std in a window (texture). Windowed. NaN-aware (fill-independent)."""
+    from scipy import ndimage
     if os.path.exists(out_path):
         print(f"  local std already exists at {out_path}, skipping"); return
     with rasterio.open(src_path) as src:
-        img = _read_band_as_float(src, band)
-        cell = _gsd_meters(src)
-        win = max(3, int(round(window_m / cell)))
-        if win % 2 == 0:
-            win += 1
-        nan_mask = np.isnan(img)
-        img_filled = np.where(nan_mask, np.nanmean(img), img)
-        mean_f  = ndimage.uniform_filter(img_filled,           size=win, mode='nearest')
-        sqmean  = ndimage.uniform_filter(img_filled * img_filled, size=win, mode='nearest')
-        var = np.maximum(sqmean - mean_f * mean_f, 0.0)
+        cell = abs(src.transform[0])
+    win = max(3, int(round(window_m / cell)))
+    if win % 2 == 0: win += 1
+
+    def focal(arr):
+        # NaN-aware mean and sqmean via valid-count normalization (fill-independent)
+        valid = (~np.isnan(arr)).astype(np.float32)
+        z = np.where(np.isnan(arr), 0.0, arr)
+        cnt = ndimage.uniform_filter(valid,   size=win, mode='nearest')
+        m   = ndimage.uniform_filter(z,       size=win, mode='nearest')
+        m2  = ndimage.uniform_filter(z * z,   size=win, mode='nearest')
+        with np.errstate(divide='ignore', invalid='ignore'):
+            mean = np.where(cnt > 0, m / cnt, np.nan)
+            sqm  = np.where(cnt > 0, m2 / cnt, np.nan)
+        var = np.maximum(sqm - mean * mean, 0.0)
         std = np.sqrt(var)
-        std[nan_mask] = np.nan
-        _write_derived_raster(out_path, std, src)
-    print(f"  wrote local std ({window_m}m window) to {out_path}")
+        std[np.isnan(arr)] = np.nan
+        return std
+
+    windowed_neighborhood(src_path, out_path, focal, radius_px=win // 2, band=band,
+                          skip_if_exists=False, label=f"local_std({window_m}m)")
 
 
 def compute_laplacian_raster(src_path, out_path, band=1):
-    """Laplacian (second derivative) of a single band — picks up edges and
-    fine-scale texture in the pan band."""
+    """Laplacian (2nd derivative). Windowed (halo=1, global-mean fill)."""
+    from scipy import ndimage
     if os.path.exists(out_path):
         print(f"  Laplacian already exists at {out_path}, skipping"); return
-    with rasterio.open(src_path) as src:
-        img = _read_band_as_float(src, band)
-        nan_mask = np.isnan(img)
-        img_filled = np.where(nan_mask, np.nanmean(img), img)
-        lap = ndimage.laplace(img_filled)
-        lap[nan_mask] = np.nan
-        _write_derived_raster(out_path, lap, src)
-    print(f"  wrote Laplacian to {out_path}")
+    gm = global_nanmean(src_path, band=band)
+
+    def focal(arr):
+        nm = np.isnan(arr)
+        filled = np.where(nm, gm, arr)
+        lap = ndimage.laplace(filled)
+        lap[nm] = np.nan
+        return lap
+
+    windowed_neighborhood(src_path, out_path, focal, radius_px=1, band=band,
+                          skip_if_exists=False, label="laplacian")
+
 
 def compute_local_range(src_path, out_path, window_m=0.3):
-    """Local max - min in a window. Roughness/texture indicator.
-    On DEM: how much elevation varies across the window — picks up burrow pock-marks.
-    On pan: brightness range — picks up texture transitions."""
-    import rasterio, numpy as np
+    """Local max - min in a window. Windowed, NaN-aware (nodata excluded)."""
     from scipy import ndimage
+    if os.path.exists(out_path):
+        print(f"  local range already exists at {out_path}, skipping"); return
     with rasterio.open(src_path) as src:
-        data = src.read(1).astype(np.float32)
-        profile = src.profile.copy()
-        gsd_m = abs(src.transform.a)
-    window_px = max(3, int(round(window_m / gsd_m)))
-    if window_px % 2 == 0:
-        window_px += 1
-    out = (ndimage.maximum_filter(data, size=window_px) -
-           ndimage.minimum_filter(data, size=window_px)).astype(np.float32)
-    profile.update(dtype='float32', count=1, compress='deflate', predictor=3)
-    with rasterio.open(out_path, 'w', **profile) as dst:
-        dst.write(out, 1)
+        cell = abs(src.transform[0])
+    win = max(3, int(round(window_m / cell)))
+    if win % 2 == 0: win += 1
+
+    def focal(arr):
+        nm = np.isnan(arr)
+        # exclude nodata from min/max by filling with +inf/-inf respectively
+        hi = np.where(nm, -np.inf, arr)
+        lo = np.where(nm,  np.inf, arr)
+        mx = ndimage.maximum_filter(hi, size=win, mode='nearest')
+        mn = ndimage.minimum_filter(lo, size=win, mode='nearest')
+        rng = mx - mn
+        # windows that were all-nodata -> inf-(-inf) or similar; mask them
+        rng[~np.isfinite(rng)] = np.nan
+        rng[nm] = np.nan
+        return rng
+
+    windowed_neighborhood(src_path, out_path, focal, radius_px=win // 2,
+                          skip_if_exists=False, label=f"local_range({window_m}m)")
 
 
 def compute_local_entropy(src_path, out_path, window_m=0.3, n_bins=16):
-    """Shannon entropy of quantized values in a local window. Higher = more variety.
-    Crab-burrowed areas have more spatial heterogeneity than smooth marsh platform."""
-    import rasterio, numpy as np
+    """Shannon entropy of quantized values in a window. Windowed.
+    Needs GLOBAL vmin/vmax for consistent binning across tiles (computed up front)."""
     from scipy import ndimage
+    if os.path.exists(out_path):
+        print(f"  local entropy already exists at {out_path}, skipping"); return
     with rasterio.open(src_path) as src:
-        data = src.read(1).astype(np.float32)
-        profile = src.profile.copy()
-        gsd_m = abs(src.transform.a)
-    valid = np.isfinite(data) & (data > 0)
-    vmin, vmax = (np.percentile(data[valid], [1, 99]) if valid.any() else (0, 1))
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
-    bin_idx = np.clip(((data - vmin) / (vmax - vmin) * n_bins).astype(np.int32),
-                      0, n_bins - 1)
-    window_px = max(3, int(round(window_m / gsd_m)))
-    if window_px % 2 == 0:
-        window_px += 1
-    entropy = np.zeros_like(data, dtype=np.float32)
-    for b in range(n_bins):
-        p = ndimage.uniform_filter((bin_idx == b).astype(np.float32), size=window_px)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            entropy += np.where(p > 0, -p * np.log(p), 0)
-    profile.update(dtype='float32', count=1, compress='deflate', predictor=3)
-    with rasterio.open(out_path, 'w', **profile) as dst:
-        dst.write(entropy, 1)
+        cell = abs(src.transform[0])
+    win = max(3, int(round(window_m / cell)))
+    if win % 2 == 0: win += 1
+
+    # global 1st/99th percentile for binning — memory-safe approximate via sampling
+    vmin, vmax = _global_percentiles(src_path, (1, 99))
+    if vmax <= vmin: vmax = vmin + 1e-6
+
+    def focal(arr):
+        valid = np.isfinite(arr) & (arr > 0)
+        bin_idx = np.clip(((arr - vmin) / (vmax - vmin) * n_bins).astype(np.int32),
+                          0, n_bins - 1)
+        entropy = np.zeros_like(arr, dtype=np.float32)
+        for b in range(n_bins):
+            p = ndimage.uniform_filter((bin_idx == b).astype(np.float32),
+                                       size=win, mode='nearest')
+            with np.errstate(divide='ignore', invalid='ignore'):
+                entropy += np.where(p > 0, -p * np.log(p), 0)
+        entropy[~valid] = np.nan
+        return entropy
+
+    windowed_neighborhood(src_path, out_path, focal, radius_px=win // 2,
+                          skip_if_exists=False, label=f"local_entropy({window_m}m)")
 
 
-def compute_dem_tri(dem_path, out_path):
-    """Terrain Ruggedness Index (Riley 1999): mean absolute elevation difference
-    from center pixel to 8 neighbors. Direct measure of micro-topographic roughness."""
-    import rasterio, numpy as np
-    with rasterio.open(dem_path) as src:
-        dem = src.read(1).astype(np.float32)
-        profile = src.profile.copy()
-    tri = np.zeros_like(dem)
-    n = 0
-    for dy in (-1, 0, 1):
-        for dx in (-1, 0, 1):
-            if dy == 0 and dx == 0:
-                continue
-            tri += np.abs(dem - np.roll(np.roll(dem, dy, axis=0), dx, axis=1))
-            n += 1
-    tri = (tri / n).astype(np.float32)
-    profile.update(dtype='float32', count=1, compress='deflate', predictor=3)
-    with rasterio.open(out_path, 'w', **profile) as dst:
-        dst.write(tri, 1)
-
-
-# ensure_* wrappers
-def ensure_local_range(paths, src_key='pan_orthomosaic', window_m=0.3, out_key='local_range'):
-    return _ensure_one(paths, src_key, out_key, f'{out_key}.tif',
-                       compute_local_range, window_m=window_m)
-
-def ensure_local_entropy(paths, src_key='pan_orthomosaic', window_m=0.3, out_key='local_entropy'):
-    return _ensure_one(paths, src_key, out_key, f'{out_key}.tif',
-                       compute_local_entropy, window_m=window_m)
-
-def ensure_dem_tri(paths, dem_key='dem_high_res', out_key='dem_tri'):
-    return _ensure_one(paths, dem_key, out_key, f'{out_key}.tif', compute_dem_tri)
+def _global_percentiles(src_path, pcts, band=1, tile=2048, max_samples=5_000_000):
+    """Approximate global percentiles by sampling tiles (memory-safe)."""
+    samples = []
+    with rasterio.open(src_path) as src:
+        src_nodata = src.nodata
+        for row in range(0, src.height, tile):
+            for col in range(0, src.width, tile):
+                h = min(tile, src.height - row); w = min(tile, src.width - col)
+                a = src.read(band, window=Window(col, row, w, h)).astype("float32").ravel()
+                if src_nodata is not None:
+                    a = a[a != src_nodata]
+                a = a[np.isfinite(a) & (a > 0)]
+                if a.size:
+                    # subsample this tile to keep memory bounded
+                    if a.size > 50000:
+                        a = a[np.random.default_rng(0).integers(0, a.size, 50000)]
+                    samples.append(a)
+                if sum(s.size for s in samples) > max_samples:
+                    break
+    alls = np.concatenate(samples) if samples else np.array([0.0, 1.0])
+    return tuple(np.percentile(alls, pcts))
   
 # ============================================================================
 # ensure_* wrappers — follow the existing ensure_indices pattern
