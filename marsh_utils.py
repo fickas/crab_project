@@ -648,112 +648,90 @@ def compute_ndwi_raster(src_path, out_path, green_band=2, nir_band=5):
 
 
 # ============================================================================
-# DEM-derived bands
+# DEM-derived bands — WINDOWED (haloed) versions.
+# Fixed-window focal ops via windowed_neighborhood. For the convolution-based
+# ones (slope, curvature, hillshade) the NaN-fill uses the GLOBAL nanmean
+# (computed memory-safely up front) so tiled output matches whole-raster
+# exactly near nodata. TPI is fill-independent (NaN-aware mean).
+#   slope, curvature, hillshade : 3x3 kernel -> halo=1
+#   tpi                         : mean window -> halo = window//2
+# Requires windowed_neighborhood, global_nanmean, _nan_uniform_mean in marsh_utils.
 # ============================================================================
+
 def compute_slope_raster(dem_path, out_path, units='degrees'):
-    """Slope from DEM using Horn's 3x3 method.
-    units: 'degrees' (0..90) or 'radians' or 'percent'."""
+    """Slope via Horn's 3x3 method. Windowed (halo=1, global-mean NaN fill)."""
+    from scipy import ndimage
     if os.path.exists(out_path):
         print(f"  Slope already exists at {out_path}, skipping"); return
     with rasterio.open(dem_path) as src:
-        dem = _read_band_as_float(src, 1)
-        cell = _gsd_meters(src)
-        # Horn's method (Sobel-style kernels normalized for slope)
-        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32) / (8.0 * cell)
-        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32) / (8.0 * cell)
-        # Fill NaNs with edge values for the convolution, mask result afterwards
-        nan_mask = np.isnan(dem)
-        dem_filled = np.where(nan_mask, np.nanmean(dem), dem)
-        dx = ndimage.convolve(dem_filled, kx, mode='nearest')
-        dy = ndimage.convolve(dem_filled, ky, mode='nearest')
-        slope_rad = np.arctan(np.sqrt(dx * dx + dy * dy))
-        if units == 'degrees':
-            slope = np.degrees(slope_rad)
-        elif units == 'radians':
-            slope = slope_rad
-        elif units == 'percent':
-            slope = np.tan(slope_rad) * 100.0
-        else:
-            raise ValueError(f"units must be degrees|radians|percent, got {units}")
-        slope[nan_mask] = np.nan
-        _write_derived_raster(out_path, slope, src)
-    print(f"  wrote slope ({units}) to {out_path}")
+        cell = abs(src.transform[0])
+    gm = global_nanmean(dem_path)
+    kx = np.array([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=np.float32) / (8.0*cell)
+    ky = np.array([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=np.float32) / (8.0*cell)
+    def focal(arr):
+        nm = np.isnan(arr); fill = np.where(nm, gm, arr)
+        dx = ndimage.convolve(fill, kx, mode='nearest')
+        dy = ndimage.convolve(fill, ky, mode='nearest')
+        srad = np.arctan(np.sqrt(dx*dx + dy*dy))
+        out = {'degrees':np.degrees,'radians':lambda x:x,'percent':lambda x:np.tan(x)*100.0}[units](srad)
+        out[nm] = np.nan; return out
+    windowed_neighborhood(dem_path, out_path, focal, radius_px=1, skip_if_exists=False,
+                          label=f"slope({units})")
 
 
 def compute_tpi_raster(dem_path, out_path, neighborhood_m=2.0):
-    """Topographic Position Index: dem - mean(dem in neighborhood).
-    Positive = relative ridge/hummock; negative = relative depression.
-    Picks up 'this bank is slumped relative to surrounding marsh' directly."""
+    """TPI = dem - mean(dem in neighborhood). Windowed (halo=window//2, fill-independent)."""
+    from scipy import ndimage
     if os.path.exists(out_path):
         print(f"  TPI already exists at {out_path}, skipping"); return
     with rasterio.open(dem_path) as src:
-        dem = _read_band_as_float(src, 1)
-        cell = _gsd_meters(src)
-        window_px = max(3, int(round(neighborhood_m / cell)))
-        if window_px % 2 == 0:
-            window_px += 1   # odd window centers cleanly
-        # Mean of valid pixels in window (ignoring NaN)
-        # Use uniform_filter with NaN handling: filter ones and values separately
-        valid = (~np.isnan(dem)).astype(np.float32)
-        dem_zeroed = np.where(np.isnan(dem), 0.0, dem)
-        sum_f = ndimage.uniform_filter(dem_zeroed, size=window_px, mode='nearest')
-        cnt_f = ndimage.uniform_filter(valid,      size=window_px, mode='nearest')
-        mean_dem = np.where(cnt_f > 0, sum_f / cnt_f, np.nan)
-        tpi = dem - mean_dem
-        _write_derived_raster(out_path, tpi, src)
-    print(f"  wrote TPI ({neighborhood_m}m window) to {out_path}")
+        cell = abs(src.transform[0])
+    window_px = max(3, int(round(neighborhood_m / cell)))
+    if window_px % 2 == 0: window_px += 1
+    def focal(arr):
+        return arr - _nan_uniform_mean(arr, window_px, ndimage)
+    windowed_neighborhood(dem_path, out_path, focal, radius_px=window_px//2,
+                          skip_if_exists=False, label=f"TPI({neighborhood_m}m)")
 
 
 def compute_curvature_raster(dem_path, out_path):
-    """Curvature via Laplacian of elevation.
-    Positive = concave (depression-like), negative = convex (ridge-like).
-    Simpler than full Zevenbergen-Thorne profile/plan curvature."""
+    """Curvature (Laplacian of elevation). Windowed (halo=1, global-mean fill)."""
+    from scipy import ndimage
     if os.path.exists(out_path):
         print(f"  Curvature already exists at {out_path}, skipping"); return
     with rasterio.open(dem_path) as src:
-        dem = _read_band_as_float(src, 1)
-        cell = _gsd_meters(src)
-        kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32) / (cell * cell)
-        nan_mask = np.isnan(dem)
-        dem_filled = np.where(nan_mask, np.nanmean(dem), dem)
-        curv = ndimage.convolve(dem_filled, kernel, mode='nearest')
-        curv[nan_mask] = np.nan
-        _write_derived_raster(out_path, curv, src)
-    print(f"  wrote curvature to {out_path}")
+        cell = abs(src.transform[0])
+    gm = global_nanmean(dem_path)
+    kernel = np.array([[0,1,0],[1,-4,1],[0,1,0]], dtype=np.float32) / (cell*cell)
+    def focal(arr):
+        nm = np.isnan(arr); fill = np.where(nm, gm, arr)
+        curv = ndimage.convolve(fill, kernel, mode='nearest'); curv[nm] = np.nan
+        return curv
+    windowed_neighborhood(dem_path, out_path, focal, radius_px=1, skip_if_exists=False,
+                          label="curvature")
 
 
 def compute_hillshade_raster(dem_path, out_path, azimuth_deg=315.0, altitude_deg=45.0):
-    """Hillshade (synthetic illumination from DEM). Output 0..255.
-    Often visually useful for QGIS inspection; less obviously useful as a model
-    input since slope+aspect carry the same info, but cheap to include."""
+    """Hillshade 0..255 uint8 (nodata=0). Windowed (halo=1, global-mean fill)."""
+    from scipy import ndimage
     if os.path.exists(out_path):
         print(f"  Hillshade already exists at {out_path}, skipping"); return
     with rasterio.open(dem_path) as src:
-        dem = _read_band_as_float(src, 1)
-        cell = _gsd_meters(src)
-        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32) / (8.0 * cell)
-        ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32) / (8.0 * cell)
-        nan_mask = np.isnan(dem)
-        dem_filled = np.where(nan_mask, np.nanmean(dem), dem)
-        dx = ndimage.convolve(dem_filled, kx, mode='nearest')
-        dy = ndimage.convolve(dem_filled, ky, mode='nearest')
-        slope = np.arctan(np.sqrt(dx * dx + dy * dy))
-        aspect = np.arctan2(dy, -dx)
-        az_rad = np.deg2rad(360.0 - azimuth_deg + 90.0)
-        alt_rad = np.deg2rad(altitude_deg)
-        hs = (np.cos(alt_rad) * np.cos(slope) +
-              np.sin(alt_rad) * np.sin(slope) * np.cos(az_rad - aspect))
-        hs = np.clip(hs * 255.0, 0, 255).astype(np.uint8)
-        hs[nan_mask] = 0
-        # Write as uint8 (not float32) since it's just a visualization layer
-        profile = src.profile.copy()
-        profile.update(count=1, dtype='uint8', nodata=0,
-                       compress='LZW', predictor=2, tiled=True,
-                       blockxsize=256, blockysize=256)
-        os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
-        with rasterio.open(out_path, 'w', **profile) as dst:
-            dst.write(hs, 1)
-    print(f"  wrote hillshade to {out_path}")
+        cell = abs(src.transform[0])
+    gm = global_nanmean(dem_path)
+    kx = np.array([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=np.float32) / (8.0*cell)
+    ky = np.array([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=np.float32) / (8.0*cell)
+    az_rad = np.deg2rad(360.0 - azimuth_deg + 90.0); alt_rad = np.deg2rad(altitude_deg)
+    def focal(arr):
+        nm = np.isnan(arr); fill = np.where(nm, gm, arr)
+        dx = ndimage.convolve(fill, kx, mode='nearest')
+        dy = ndimage.convolve(fill, ky, mode='nearest')
+        slope = np.arctan(np.sqrt(dx*dx + dy*dy)); aspect = np.arctan2(dy, -dx)
+        hs = (np.cos(alt_rad)*np.cos(slope) + np.sin(alt_rad)*np.sin(slope)*np.cos(az_rad - aspect))
+        hs = np.clip(hs*255.0, 0, 255); hs[nm] = 0.0
+        return hs
+    windowed_neighborhood(dem_path, out_path, focal, radius_px=1,
+                          dtype="uint8", nodata=0, skip_if_exists=False, label="hillshade")
 
 
 # ============================================================================
