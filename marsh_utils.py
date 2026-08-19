@@ -5282,10 +5282,12 @@ import os
 import numpy as np
 import rasterio
 from rasterio.windows import from_bounds, Window
+from rasterio.warp import reproject, Resampling
 
 
 def align_dem_to_ortho(dem_path, ortho_path, out_path,
-                       res_tol=1e-4, skip_if_exists=True, tile=4096):
+                       res_tol=1e-4, skip_if_exists=True, tile=4096,
+                       resample=False, resampling=Resampling.bilinear):
     """Return a DEM aligned to the ortho grid.
 
     - If dem already matches ortho grid exactly -> returns dem_path (no file written).
@@ -5294,6 +5296,12 @@ def align_dem_to_ortho(dem_path, ortho_path, out_path,
 
     Match = same CRS, same resolution (within res_tol), same shape, and pixel
     origins aligned to within a tiny fraction of a pixel.
+
+    resample : if the grids share CRS+resolution but are offset by a NON-integer
+        number of pixels (can't clean-crop), resample=True reprojects the DEM
+        onto the ortho's exact grid (bilinear) instead of raising. Elevation
+        values are interpolated onto the new lattice (standard for DEMs).
+        resample=False (default) raises on a fractional offset.
     """
     with rasterio.open(dem_path) as dem, rasterio.open(ortho_path) as ortho:
         # CRS must match (reprojection is out of scope here)
@@ -5319,10 +5327,38 @@ def align_dem_to_ortho(dem_path, ortho_path, out_path,
             return dem_path
 
         if not aligned:
-            raise ValueError(
-                f"DEM and ortho share CRS+resolution but pixel grids are offset by a "
-                f"non-integer number of pixels (dx={dx:.3f}, dy={dy:.3f}). A clean crop "
-                f"needs integer alignment; resampling would be required otherwise.")
+            if not resample:
+                raise ValueError(
+                    f"DEM and ortho share CRS+resolution but pixel grids are offset by a "
+                    f"non-integer number of pixels (dx={dx:.3f}, dy={dy:.3f}). Pass "
+                    f"resample=True to resample the DEM onto the ortho grid, or align "
+                    f"upstream. (A clean crop needs integer alignment.)")
+            # ── resample the DEM onto the ortho's exact grid ──
+            if skip_if_exists and os.path.exists(out_path):
+                print(f"  resampled DEM already exists at {out_path}, skipping")
+                return out_path
+            profile = ortho.profile.copy()
+            for _k in ("blockxsize", "blockysize", "tiled"):
+                profile.pop(_k, None)
+            src_nodata = dem.nodata
+            dst_nodata = src_nodata if src_nodata is not None else np.nan
+            profile.update(count=1, dtype='float32', nodata=dst_nodata,
+                           transform=ortho.transform, width=ortho.width,
+                           height=ortho.height, compress='lzw', tiled=True,
+                           blockxsize=256, blockysize=256, BIGTIFF='IF_SAFER')
+            os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+            with rasterio.open(out_path, 'w', **profile) as dst:
+                reproject(
+                    source=rasterio.band(dem, 1),
+                    destination=rasterio.band(dst, 1),
+                    src_transform=dem.transform, src_crs=dem.crs,
+                    dst_transform=ortho.transform, dst_crs=ortho.crs,
+                    src_nodata=src_nodata, dst_nodata=dst_nodata,
+                    resampling=resampling,
+                )
+            print(f"  resampled DEM {dem.width}×{dem.height} -> "
+                  f"{ortho.width}×{ortho.height} (ortho grid) at {out_path}")
+            return out_path
 
         # ortho must fall within the DEM to crop cleanly
         ob = ortho.bounds; db = dem.bounds
