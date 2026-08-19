@@ -5137,3 +5137,107 @@ def compute_savi_raster(src_path, out_path, red_band=3, nir_band=5, L=0.5):
         in_bands={'red': red_band, 'nir': nir_band},
         label="SAVI",
     )
+
+# ============================================================================
+# Windowed neighborhood (focal) operations for marsh_utils.
+# For ops that need surrounding pixels (TPI, local_std, laplacian, local_range,
+# local_entropy, hillshade, ...). Whole-raster versions OOM on real orthos.
+#
+# Haloed tiling: each output tile is computed from an input tile PADDED by a
+# halo (>= the filter radius), so edge pixels have their neighbors; only the
+# interior is written. Edge tiles clamp the halo at the raster boundary, and
+# the focal fn is told to use 'nearest' there — matching the whole-raster
+# mode='nearest' behavior. Peak memory ~ (tile+2*halo)^2 * few arrays, not the
+# whole raster.
+# ============================================================================
+
+import os
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+
+
+def windowed_neighborhood(src_path, out_path, focal_fn, radius_px,
+                          band=1, tile=2048, nodata=np.nan, dtype="float32",
+                          skip_if_exists=True, label=None):
+    """Apply a focal function tile-by-tile with a halo.
+
+    focal_fn(arr) -> same-shape array : the neighborhood op on a padded float
+        tile (NaN = nodata). It must be translation-invariant so that computing
+        on a padded tile and cropping equals the whole-raster result.
+    radius_px : halo width in pixels (>= half the focal window). For a window of
+        W pixels, pass radius_px = W // 2.
+    tile      : interior tile size. Effective read is (tile + 2*radius_px)^2.
+    """
+    name = label or os.path.basename(out_path)
+    if skip_if_exists and os.path.exists(out_path):
+        print(f"  {name} already exists, skipping")
+        return
+
+    with rasterio.open(src_path) as src:
+        H, W = src.height, src.width
+        src_nodata = src.nodata
+        profile = src.profile.copy()
+        profile.update(count=1, dtype=dtype, nodata=nodata, compress="lzw",
+                       tiled=True, blockxsize=256, blockysize=256, BIGTIFF="IF_SAFER")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            r = radius_px
+            n = 0
+            for row in range(0, H, tile):
+                for col in range(0, W, tile):
+                    h = min(tile, H - row)
+                    w = min(tile, W - col)
+
+                    # padded read window, clamped to raster bounds
+                    r0 = max(0, row - r); c0 = max(0, col - r)
+                    r1 = min(H, row + h + r); c1 = min(W, col + w + r)
+                    win = Window(c0, r0, c1 - c0, r1 - r0)
+
+                    arr = src.read(band, window=win).astype("float32")
+                    if src_nodata is not None:
+                        arr = np.where(arr == src_nodata, np.nan, arr)
+
+                    out = focal_fn(arr).astype(dtype)
+
+                    # crop back to the interior tile: offset of (row,col) within padded arr
+                    off_r = row - r0
+                    off_c = col - c0
+                    interior = out[off_r:off_r + h, off_c:off_c + w]
+                    dst.write(interior, 1, window=Window(col, row, w, h))
+                    n += 1
+    print(f"  wrote {name} ({n} tiles, halo={radius_px}px) -> {out_path}")
+
+
+# ── helper focal ops (NaN-aware) ──
+
+def _nan_uniform_mean(arr, size, ndimage):
+    """Mean over a window, ignoring NaN (values/counts filtered separately).
+    Matches the whole-raster TPI approach."""
+    valid = (~np.isnan(arr)).astype(np.float32)
+    zeroed = np.where(np.isnan(arr), 0.0, arr)
+    sum_f = ndimage.uniform_filter(zeroed, size=size, mode='nearest')
+    cnt_f = ndimage.uniform_filter(valid,  size=size, mode='nearest')
+    return np.where(cnt_f > 0, sum_f / cnt_f, np.nan)
+
+
+# ── windowed TPI (drop-in replacement) ──
+
+def compute_tpi_raster(dem_path, out_path, neighborhood_m=2.0):
+    """Topographic Position Index: dem - mean(dem in neighborhood). Windowed."""
+    from scipy import ndimage
+    # derive window from GSD, same as the original
+    with rasterio.open(dem_path) as src:
+        cell = abs(src.transform[0])  # GSD in CRS units (m)
+    window_px = max(3, int(round(neighborhood_m / cell)))
+    if window_px % 2 == 0:
+        window_px += 1
+    radius_px = window_px // 2
+
+    def focal(arr):
+        mean_dem = _nan_uniform_mean(arr, window_px, ndimage)
+        return arr - mean_dem
+
+    windowed_neighborhood(dem_path, out_path, focal, radius_px,
+                          label=f"TPI({neighborhood_m}m)")
