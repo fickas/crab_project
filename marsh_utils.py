@@ -5264,3 +5264,99 @@ def global_nanmean(src_path, band=1, tile=2048):
                 total += a.sum(); count += a.size
     return (total / count) if count else 0.0
 
+
+# Add to marsh_utils.py
+#
+# Align a DEM to the ortho's grid. If the DEM already matches (same CRS,
+# resolution, extent, pixel alignment) it's a no-op — returns the DEM path
+# unchanged. If the DEM is larger/offset (same CRS + resolution, ortho inside
+# it), it crops to the ortho footprint on the ortho's exact grid (integer-pixel
+# window, no resampling). Result: a DEM the same shape/origin as the ortho, so
+# DEM-derived bands stack directly with ortho-derived bands.
+#
+# Requires: same CRS and (near-)identical resolution between DEM and ortho.
+# If the resolution differs or CRS differs, it raises (that needs reprojection,
+# which is a heavier, separate operation).
+
+import os
+import numpy as np
+import rasterio
+from rasterio.windows import from_bounds, Window
+
+
+def align_dem_to_ortho(dem_path, ortho_path, out_path,
+                       res_tol=1e-4, skip_if_exists=True, tile=4096):
+    """Return a DEM aligned to the ortho grid.
+
+    - If dem already matches ortho grid exactly -> returns dem_path (no file written).
+    - Else crops dem to the ortho footprint on the ortho's grid -> writes out_path,
+      returns out_path.
+
+    Match = same CRS, same resolution (within res_tol), same shape, and pixel
+    origins aligned to within a tiny fraction of a pixel.
+    """
+    with rasterio.open(dem_path) as dem, rasterio.open(ortho_path) as ortho:
+        # CRS must match (reprojection is out of scope here)
+        if dem.crs != ortho.crs:
+            raise ValueError(f"CRS mismatch: DEM {dem.crs} vs ortho {ortho.crs}. "
+                             f"Reproject the DEM to {ortho.crs} first.")
+
+        dres = (abs(dem.transform.a), abs(dem.transform.e))
+        ores = (abs(ortho.transform.a), abs(ortho.transform.e))
+        if abs(dres[0]-ores[0]) > res_tol or abs(dres[1]-ores[1]) > res_tol:
+            raise ValueError(f"Resolution mismatch: DEM {dres} vs ortho {ores}. "
+                             f"Resample the DEM to the ortho resolution first.")
+
+        # already an exact grid match? -> no-op
+        same_shape = (dem.width == ortho.width and dem.height == ortho.height)
+        # origin offset in pixels
+        dx = (ortho.transform.c - dem.transform.c) / ortho.transform.a
+        dy = (ortho.transform.f - dem.transform.f) / ortho.transform.e
+        aligned = (abs(dx - round(dx)) < 1e-3 and abs(dy - round(dy)) < 1e-3)
+
+        if same_shape and abs(dx) < 1e-3 and abs(dy) < 1e-3:
+            print(f"  DEM already matches ortho grid ({dem.width}×{dem.height}) — no crop needed")
+            return dem_path
+
+        if not aligned:
+            raise ValueError(
+                f"DEM and ortho share CRS+resolution but pixel grids are offset by a "
+                f"non-integer number of pixels (dx={dx:.3f}, dy={dy:.3f}). A clean crop "
+                f"needs integer alignment; resampling would be required otherwise.")
+
+        # ortho must fall within the DEM to crop cleanly
+        ob = ortho.bounds; db = dem.bounds
+        if not (db.left <= ob.left and db.bottom <= ob.bottom and
+                db.right >= ob.right and db.top >= ob.top):
+            raise ValueError("Ortho extent is not fully inside the DEM; cannot crop "
+                             "to the ortho footprint without missing data.")
+
+        if skip_if_exists and os.path.exists(out_path):
+            print(f"  cropped DEM already exists at {out_path}, skipping")
+            return out_path
+
+        # window of the ortho footprint in DEM pixel space (integer-aligned)
+        win = from_bounds(ob.left, ob.bottom, ob.right, ob.top, transform=dem.transform)
+        col_off = int(round(win.col_off)); row_off = int(round(win.row_off))
+        width   = ortho.width; height = ortho.height
+
+        profile = dem.profile.copy()
+        for _k in ("blockxsize", "blockysize", "tiled"):
+            profile.pop(_k, None)
+        profile.update(width=width, height=height,
+                       transform=ortho.transform,   # adopt ortho's exact transform
+                       compress="lzw", tiled=True,
+                       blockxsize=256, blockysize=256, BIGTIFF="IF_SAFER")
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            # copy the window tile-by-tile (memory-safe on huge DEMs)
+            for r in range(0, height, tile):
+                for c in range(0, width, tile):
+                    h = min(tile, height - r); w = min(tile, width - c)
+                    src_win = Window(col_off + c, row_off + r, w, h)
+                    dst.write(dem.read(1, window=src_win), 1,
+                              window=Window(c, r, w, h))
+        print(f"  cropped DEM {dem.width}×{dem.height} -> {width}×{height} "
+              f"(ortho grid) at {out_path}")
+        return out_path
