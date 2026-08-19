@@ -5054,5 +5054,86 @@ def pick_run(paths, match):
     raise ValueError(f"{len(hits)} runs match {match!r}: "
                      + ", ".join(os.path.basename(h) for h in hits))
 
+# Windowed raster math for marsh_utils — process gigapixel orthos tile-by-tile
+# so memory stays flat. Replaces the whole-raster _read_band_as_float pattern
+# that OOMs on real orthos (52054 x 64627 ≈ 3.4 Gpx ≈ 13.5 GB per float band).
+#
+# Core idea: rasterio block windows. Read only a tile of each needed band,
+# compute, write the tile, move on. Peak memory ≈ (n_bands_in + 1) * tile_pixels
+# * 4 bytes — a few MB, not tens of GB.
+
+import os
+import numpy as np
+import rasterio
+from rasterio.windows import Window
 
 
+def _iter_windows(src, tile=2048):
+    """Yield Window objects tiling the raster in tile x tile blocks."""
+    for row in range(0, src.height, tile):
+        h = min(tile, src.height - row)
+        for col in range(0, src.width, tile):
+            w = min(tile, src.width - col)
+            yield Window(col, row, w, h)
+
+
+def windowed_band_math(src_path, out_path, fn, in_bands,
+                       tile=2048, nodata=np.nan, dtype="float32",
+                       skip_if_exists=True, label=None):
+    """Apply a per-pixel function `fn` over one or more input bands, tile by tile.
+
+    src_path   : source raster
+    out_path   : single-band float output
+    fn         : callable(arrays_dict) -> 2D array for the tile, where arrays_dict
+                 maps each name in in_bands to that tile's float array.
+    in_bands   : dict {name: band_index (1-based)} of bands to read per tile.
+    tile       : block size in pixels (2048 -> ~16 MB per band tile).
+
+    Example (SAVI):
+        windowed_band_math(src, out,
+            lambda b: (b['nir']-b['red'])/(b['nir']+b['red']+0.5)*1.5,
+            in_bands={'red':3, 'nir':5})
+    """
+    name = label or os.path.basename(out_path)
+    if skip_if_exists and os.path.exists(out_path):
+        print(f"  {name} already exists, skipping")
+        return
+
+    with rasterio.open(src_path) as src:
+        profile = src.profile.copy()
+        profile.update(count=1, dtype=dtype, nodata=nodata,
+                       compress="lzw", tiled=True,
+                       blockxsize=256, blockysize=256, BIGTIFF="IF_SAFER")
+        src_nodata = src.nodata
+
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with rasterio.open(out_path, "w", **profile) as dst:
+            n = 0
+            for win in _iter_windows(src, tile):
+                arrays = {}
+                mask = None
+                for nm, bidx in in_bands.items():
+                    a = src.read(bidx, window=win).astype("float32")
+                    if src_nodata is not None:
+                        m = (a == src_nodata)
+                        mask = m if mask is None else (mask | m)
+                    arrays[nm] = a
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    out = fn(arrays).astype(dtype)
+                if mask is not None:
+                    out[mask] = nodata
+                dst.write(out, 1, window=win)
+                n += 1
+    print(f"  wrote {name} ({n} tiles) -> {out_path}")
+
+
+# ── Example: windowed SAVI (drop-in replacement body) ──
+def compute_savi_raster(src_path, out_path, red_band=3, nir_band=5, L=0.5):
+    """SAVI, windowed. Same signature/output as the original, but tiled so it
+    doesn't load the whole raster."""
+    windowed_band_math(
+        src_path, out_path,
+        fn=lambda b: (b['nir'] - b['red']) / (b['nir'] + b['red'] + L) * (1.0 + L),
+        in_bands={'red': red_band, 'nir': nir_band},
+        label="SAVI",
+    )
