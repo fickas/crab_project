@@ -510,3 +510,113 @@ For readers from different backgrounds — terms used throughout this report.
 **TPI (Topographic Position Index)** — Per-pixel measure of elevation relative to a local neighborhood mean. Positive = local high (ridge/bump), negative = local low (depression). Multi-scale.
 
 **TRI (Terrain Ruggedness Index)** — Per-pixel measure of surface roughness: mean absolute elevation difference from a center pixel to its 8 neighbors. From Riley et al. 1999.
+
+## First real imagery: ortho co-registration and pansharpening (October 2026)
+
+### Summary
+
+The first real orthomosaics arrived as two separate products: a panchromatic (pan) ortho at 0.93 cm and a 6-band multispectral (MS) ortho at 1.76 cm. They turned out to come from **separate photogrammetric processing runs**, and they did not line up: the MS was misregistered against the pan by up to **37 cm**. This was not a simple shift. The MS was scaled by roughly 0.07–0.1% relative to the pan, and one survey block was also gently bent.
+
+We built a measurement-and-correction pipeline that brings the two into agreement to **≤4 cm in block 1 (most points 1–2 cm) and ≤2 cm in block 2**, verified at independent test points. The MS is resampled only once, directly onto the pan grid, and then pansharpened with weighted Brovey to 0.93 cm. NDVI is preserved to rounding precision (about 2×10⁻⁴).
+
+### Input data as delivered
+
+| | Pan ortho | MS ortho |
+|---|---|---|
+| Size (as delivered) | 146,892 × 127,195 | 52,054 × 64,627 × 6 bands |
+| Size (after clipping to shared extent) | 98,150 × 122,155 | 51,927 × 64,627 × 6 bands |
+| Pixel size | 0.9319 cm | 1.7614 cm |
+| Data type | UInt16 | UInt16 |
+| CRS label | EPSG:6491 (NAD83(2011) / MA Mainland) | EPSG:26986 (NAD83 / MA Mainland) |
+| Band order | single band | Blue, Green, Panchro, Red, Red edge, NIR |
+| Declared nodata | none | none |
+| Actual fill value | 65535 (76% of extent) | 65535 (73% of extent) |
+| Zero strip at bottom edge | ~1.7% of rows | ~4.6% of rows |
+| TIFF layout | stripped (full-width strips, 32 rows) | — |
+
+The pan/MS resolution ratio is 1.89. The scene contains **two separate survey blocks** (a large diagonal northwest block and a smaller southeast block) with nothing between them. Within the shared extent, 21% of pixels have both pan and MS data, which is about 92% of the combined footprint, or roughly 22 ha that can be pansharpened.
+
+### Preprocessing
+
+1. **Tiled, clipped local copies.** The stripped pan made small-window reads extremely slow, so both rasters were converted to 512×512 tiled, DEFLATE-compressed GeoTIFFs. During the copy, the pan was clipped to the MS extent, which removed about 450 m of pan with no MS coverage. The converted copies are stored on Drive.
+2. **CRS relabel, not reprojection.** Both CRSs are the same projection (MA State Plane Mainland) on different realizations of the NAD83 datum. The MS was relabeled EPSG:6491 without resampling. Any real datum offset is absorbed by the measured co-registration correction below.
+3. **No-data handling.** A lightweight VRT wrapper maps 0 → 65535 and declares 65535 as nodata, so both fill types are masked without rewriting the rasters.
+
+### Co-registration: measurement
+
+Offsets were measured by phase correlation between the pan and the MS (RGB mean) at test points where both rasters have data. Both images were resampled to a common 5 cm grid in 40–60 m windows, so offsets of several decimeters are detectable. Two details proved essential: (a) honoring the true fill value (an early run that treated 0 as nodata was measuring footprint outlines, not imagery), and (b) tapering each window (Hann) before correlating, without which estimates were biased toward zero shift. Test points were assigned to survey blocks automatically by connected-component analysis of the shared footprint.
+
+The measured offsets formed a smooth spatial pattern rather than a constant shift. Shift, affine, and quadratic models were fitted per block, and each was scored by **leave-one-out RMS**: each point is predicted from a fit that excludes it.
+
+| Block | Points | Max offset | Shift-only LOO | Affine LOO | Quadratic LOO | Chosen |
+|---|---|---|---|---|---|---|
+| 1 (NW, 4.14 Gpx) | 35 | 37 cm | 21.3 cm | 8.4 cm | 2.4 cm | quadratic |
+| 2 (SE, 1.00 Gpx) | 16 | 16 cm | 8.1 cm | 2.2 cm | 1.5 cm | quadratic |
+
+The affine fits show near-isotropic scale differences of about +910 ppm (block 1) and +665 ppm (block 2). In block 1 there is additional bending that only the quadratic model captures. The two blocks have different geometry, so they are corrected independently.
+
+**Interpretation:** this pattern is the signature of two independent photogrammetric solutions (separate camera alignment, lens self-calibration, and surface model), not of a sensor or datum problem. The CRS label difference and the different original extents are consistent with this.
+
+### Co-registration: correction and verification
+
+For each block, the fitted model is applied as a GCP polynomial warp (order matches the model) that resamples the MS **once, with cubic interpolation, directly onto the pan grid**. The pansharpening step then does no further resampling. This step also produces MS on the pan grid for derived bands (NDVI, NDRE).
+
+Verification used fresh test points not used in fitting:
+
+| Block | Test points | Residual after correction |
+|---|---|---|
+| 1 | 21 | 0–4 cm (most 1–2 cm) |
+| 2 | 30 | ≤2 cm (most ≤1 cm) |
+
+About 1 cm is the measurement floor at the 5 cm comparison grid. After correction, the two inputs agree to about one MS pixel or better.
+
+### Pansharpening
+
+- **Method:** GDAL weighted Brovey, equal weights over the 5 spectral bands, run lazily from VRTs and written per block as Cloud-Optimized GeoTIFFs (DEFLATE, internal overviews). Band names are embedded in the outputs.
+- **Output band order:** 1 Blue, 2 Green, 3 Red, 4 Red edge, 5 NIR. The MS pan band (band 3 in the delivered file) is excluded.
+- **Derived indices on the pansharpened outputs:** NDVI = (b5 − b3)/(b5 + b3); NDRE = (b5 − b4)/(b5 + b4).
+- **Spectral fidelity check:** NDVI from the pansharpened output against NDVI from the corrected MS. In the test run: 99th-percentile difference 1–2×10⁻⁴, maximum ≤8×10⁻⁴, apart from a handful of footprint-edge pixels. Brovey preserves band ratios by design, so this result holds for any band pair.
+- **Sharpness:** the visible gain over the MS is real but modest, as expected for a 1.9× resolution ratio. The gain is clearest at stem and burrow scale and requires zooming in to see. Model 1 takes the pan channel directly, so the model receives the full 0.93 cm detail regardless.
+- **Labeling product:** an 8-bit JPEG COG (true color, bands 3/2/1) with a single shared stretch across bands and blocks, so the two blocks match in QGIS.
+- **Runtime:** block 2 (1.0 Gpx) took 38 min on a Colab A100 high-RAM runtime. Block 1 (4.1 Gpx) is estimated at about 2.5 h.
+
+### Open issues and follow-ups
+
+- **Processing workflow (for future flights):** pan and MS should come from one photogrammetric project. One option is to render the MS project at the pan's native resolution, if the software keeps the pan frames at full resolution. Another is to process both against shared ground control. Either would make the correction step unnecessary. Question sent to Ryan.
+- **Radiometric calibration:** values look like reflectance × 10,000, but blue is high for marsh vegetation (about 0.09). We need to confirm whether panel calibration was applied and what the scale factor is. This matters for comparing flights.
+- **Possible truncated exports:** both files end in a band of zero rows. The MS also stops short of the pan along the south edge of the southeast block.
+- **CRS consistency:** deliveries are in MA State Plane (EPSG:6491). Check against the CRS assumed in Config and in existing label layers.
+- **Footprint edges:** the outermost pixels along footprint boundaries can carry resampling artifacts. Erode the valid-data mask by a few pixels when cutting training and inference tiles.
+
+### Repeatable workflow for each new flight
+
+1. Inspect metadata: CRS, pixel size, fill values, band names, block layout.
+2. Make tiled, clipped local copies and zero → nodata VRT wrappers.
+3. Pick test points where both rasters have data; measure coarse offsets.
+4. Fit shift, affine, and quadratic models per block; choose by leave-one-out RMS.
+5. Warp the MS (spectral bands only) onto the pan grid per block; verify with fresh points.
+6. Pansharpen per block, embed band names, check NDVI invariance, and build the labeling RGB.
+
+### Artifacts
+
+| File | Contents |
+|---|---|
+| `pan_tiled_clip_6491.tif`, `ms_tiled_clip_6491.tif` | Tiled, clipped working copies (Drive) |
+| `coreg_state.pkl` | Test points, offsets, block bounds, fitted models (Drive) |
+| `ps_block{1,2}_5band_cog.tif` | Pansharpened B, G, R, RE, NIR at 0.93 cm |
+| `ps_block{1,2}_rgb_cog.tif` | 8-bit true-color labeling COGs |
+| `pansharpen_preflight.py` | Metadata preflight, fine-scale offset check |
+| `zero_mask_vrt.py` | 0 → nodata VRT wrapper |
+| `coreg_diagnostics.py` | Test-point selection, coarse offset measurement with diagnostic figures |
+| `coreg_fit.py` | Block detection, model fitting with leave-one-out, per-block MS warp |
+| `labeling_rgb.py` | 8-bit RGB COG with shared or reused stretch |
+
+### Glossary additions
+
+- **Co-registration:** aligning two images so the same ground point falls on the same pixel in both.
+- **Phase correlation:** a Fourier-based method for measuring the shift between two image patches.
+- **Leave-one-out RMS:** the error of predicting each test point from a model fitted without it; an honest estimate of error at unmeasured locations.
+- **GCP polynomial warp:** resampling an image through a polynomial mapping defined by ground control points; here, the points are generated from the fitted correction model.
+- **Weighted Brovey:** a pansharpening method that scales each MS band by pan / (weighted sum of MS bands); it preserves band ratios such as NDVI.
+- **VRT:** a GDAL virtual raster, a small XML file describing a raster computed on the fly from other files.
+- **COG:** Cloud-Optimized GeoTIFF, a tiled GeoTIFF with internal overviews for fast partial reads.
