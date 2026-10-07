@@ -5396,3 +5396,119 @@ def align_dem_to_ortho(dem_path, ortho_path, out_path,
         print(f"  cropped DEM {dem.width}×{dem.height} -> {width}×{height} "
               f"(ortho grid) at {out_path}")
         return out_path
+
+"""Faster drop-in for marsh_utils.build_patches_with_splits_multi.
+
+Same inputs, same outputs, same train/val/test assignment. The original visits every
+patch position in the raster, reads every band there, and rasterizes EVERY polygon before
+checking whether the patch has any labels. This version:
+  1. uses a spatial index to skip positions no polygon touches, before reading anything,
+  2. rasterizes only the polygons near each patch,
+  3. builds the label mask first and reads the image bands only for patches that keep labels.
+The first pass (all patch positions -> blocks -> splits) is unchanged, so splits are identical.
+"""
+from contextlib import ExitStack
+
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.features import rasterize
+from rasterio.vrt import WarpedVRT
+from rasterio.windows import Window, bounds as window_bounds
+from shapely.geometry import box
+
+import marsh_utils as mu
+
+
+def build_patches_with_splits_multi_fast(paths, polygons_gdf, cfg, resampling=Resampling.bilinear):
+    band_spec = cfg.BAND_SPEC
+    patch_size, overlap = cfg.PATCH_SIZE, cfg.OVERLAP
+    block_size_m, priority = cfg.BLOCK_SIZE_M, cfg.PRIORITY
+    train_frac, val_frac, seed = cfg.TRAIN_FRAC, cfg.VAL_FRAC, cfg.SEED
+    require_labels, class_col, ignore_value = cfg.REQUIRE_LABELS, cfg.CLASS_COLUMN, cfg.IGNORE_INDEX
+    if not band_spec:
+        raise ValueError("band_spec must contain at least one entry")
+    stride = max(1, int(patch_size * (1 - overlap)))
+
+    raster_paths_ordered = []
+    for key, _ in band_spec:
+        if paths[key] not in raster_paths_ordered:
+            raster_paths_ordered.append(paths[key])
+    band_spec_resolved = [(paths[key], idx) for key, idx in band_spec]
+
+    with ExitStack() as stack:
+        ref_path = raster_paths_ordered[0]
+        ref_src = stack.enter_context(rasterio.open(ref_path))
+        sources = {ref_path: ref_src}
+        for p in raster_paths_ordered[1:]:
+            src = stack.enter_context(rasterio.open(p))
+            if mu._grids_match(src, ref_src):
+                sources[p] = src
+            else:
+                print(f"  note: {p} is on a different grid; resampling it on the fly (slow)")
+                sources[p] = stack.enter_context(WarpedVRT(
+                    src, crs=ref_src.crs, transform=ref_src.transform,
+                    width=ref_src.width, height=ref_src.height, resampling=resampling))
+
+        if polygons_gdf.crs != ref_src.crs:
+            polygons_gdf = polygons_gdf.to_crs(ref_src.crs)
+
+        # same priority ordering as the original: higher priority rasterized last (wins)
+        gdf = polygons_gdf
+        if priority is not None:
+            rank = {c: i for i, c in enumerate(priority)}
+            gdf = polygons_gdf.copy()
+            gdf['_rank'] = gdf[class_col].map(lambda c: rank.get(c, len(priority)))
+            gdf = gdf.sort_values('_rank', ascending=False, kind='stable')
+        gdf = gdf.reset_index(drop=True)
+        geoms = gdf.geometry.values
+        vals = gdf[class_col].astype(np.uint8).values
+        sindex = gdf.sindex
+
+        bands_by_path = {}
+        for path, band_idx in band_spec_resolved:
+            bands_by_path.setdefault(path, []).append(band_idx)
+
+        h, w = ref_src.height, ref_src.width
+        # first pass: identical to the original -> identical block -> split assignment
+        patch_locations, patch_blocks = [], []
+        for row in range(0, h - patch_size + 1, stride):
+            for col in range(0, w - patch_size + 1, stride):
+                x_world, y_world = ref_src.xy(row + patch_size // 2, col + patch_size // 2)
+                patch_locations.append((row, col))
+                patch_blocks.append(mu.get_block_id(x_world, y_world, block_size_m))
+        block_to_split = mu.assign_blocks_to_splits(patch_blocks, train_frac, val_frac, seed)
+
+        n_checked = n_kept = 0
+        for (row, col), block in zip(patch_locations, patch_blocks):
+            window = Window(col, row, patch_size, patch_size)
+            window_transform = ref_src.window_transform(window)
+            hits = sindex.query(box(*window_bounds(window, ref_src.transform)))
+            if len(hits) == 0:
+                if require_labels:
+                    continue
+                mask = np.full((patch_size, patch_size), ignore_value, dtype=np.uint8)
+            else:
+                hits = np.sort(hits)                       # keep priority order
+                n_checked += 1
+                mask = rasterize(list(zip(geoms[hits], vals[hits])),
+                                 out_shape=(patch_size, patch_size), transform=window_transform,
+                                 fill=ignore_value, dtype=np.uint8)
+            labeled_fraction = float((mask != ignore_value).mean())
+            if require_labels and labeled_fraction == 0:
+                continue
+
+            arrays_by_key = {}
+            for path, band_indices in bands_by_path.items():
+                arr = sources[path].read(band_indices, window=window)
+                for i, b in enumerate(band_indices):
+                    arrays_by_key[(path, b)] = arr[i]
+            image = np.stack([arrays_by_key[(path, b)] for path, b in band_spec_resolved], axis=0)
+            n_kept += 1
+            yield {
+                'image': image, 'mask': mask, 'window': window, 'transform': window_transform,
+                'labeled_fraction': labeled_fraction, 'split': block_to_split[block],
+                'block_id': block,
+            }
+        print(f"  patch positions: {len(patch_locations):,} total, {n_checked:,} near labels, "
+              f"{n_kept:,} kept")
