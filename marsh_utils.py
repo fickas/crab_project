@@ -5397,30 +5397,47 @@ def align_dem_to_ortho(dem_path, ortho_path, out_path,
               f"(ortho grid) at {out_path}")
         return out_path
 
-"""Faster drop-in for marsh_utils.build_patches_with_splits_multi.
+# ==== Paste into marsh_utils.py, REPLACING any existing build_patches_with_splits_multi_fast ====
+# Needs numpy as np and rasterio at the top of marsh_utils.py (already there).
 
-Same inputs, same outputs, same train/val/test assignment. The original visits every
-patch position in the raster, reads every band there, and rasterizes EVERY polygon before
-checking whether the patch has any labels. This version:
-  1. uses a spatial index to skip positions no polygon touches, before reading anything,
-  2. rasterizes only the polygons near each patch,
-  3. builds the label mask first and reads the image bands only for patches that keep labels.
-The first pass (all patch positions -> blocks -> splits) is unchanged, so splits are identical.
-"""
-from contextlib import ExitStack
+def _label_aware_assignment(patch_blocks, near_labels, gdf, class_col, block_size_m,
+                            train_frac, val_frac, seed, n_tries=500):
+    """Assign splits over LABELED blocks only, choosing among n_tries seeds the assignment
+    whose val and test splits get the most even share of every class (by polygon area)."""
+    labeled_blocks = sorted({b for b, near in zip(patch_blocks, near_labels) if near})
+    cent = gdf.geometry.centroid
+    blk = [get_block_id(x, y, block_size_m) for x, y in zip(cent.x, cent.y)]
+    area = gdf.geometry.area.values
+    cls_vals = gdf[class_col].values
+    classes = sorted(set(cls_vals))
+    tot = {c: area[cls_vals == c].sum() for c in classes}
+    best, best_score, best_seed = None, -1.0, seed
+    for k in range(n_tries):
+        a = assign_blocks_to_splits(labeled_blocks, train_frac, val_frac, seed + k)
+        split_of_poly = np.array([a.get(b) for b in blk])
+        score = min(area[(cls_vals == c) & (split_of_poly == s)].sum() / max(tot[c], 1e-9)
+                    for s in ("val", "test") for c in classes)   # worst-covered (split, class)
+        if score > best_score:
+            best, best_score, best_seed = a, score, seed + k
+    print(f"  label-aware split: {len(labeled_blocks)} labeled blocks, seed {best_seed}; "
+          f"smallest val/test share of any class = {best_score:.1%}")
+    return best
 
-import numpy as np
-import rasterio
-from rasterio.enums import Resampling
-from rasterio.features import rasterize
-from rasterio.vrt import WarpedVRT
-from rasterio.windows import Window, bounds as window_bounds
-from shapely.geometry import box
 
-import marsh_utils as mu
-
-
-def build_patches_with_splits_multi_fast(paths, polygons_gdf, cfg, resampling=Resampling.bilinear):
+def build_patches_with_splits_multi_fast(paths, polygons_gdf, cfg, resampling=None,
+                                         label_aware_splits=False):
+    """label_aware_splits=False: identical results to build_patches_with_splits_multi.
+    label_aware_splits=True : splits are assigned only over blocks that contain labels, picking the
+        assignment that gives val and test a fair share of every class. Use this when labels are
+        sparse: the original assigns splits over ALL blocks, including empty ones, so val or test
+        can end up with almost nothing."""
+    from contextlib import ExitStack
+    from rasterio.enums import Resampling as _Resampling
+    from rasterio.features import rasterize
+    from rasterio.vrt import WarpedVRT
+    from rasterio.windows import Window, bounds as window_bounds
+    from shapely.geometry import box
+    resampling = _Resampling.bilinear if resampling is None else resampling
     band_spec = cfg.BAND_SPEC
     patch_size, overlap = cfg.PATCH_SIZE, cfg.OVERLAP
     block_size_m, priority = cfg.BLOCK_SIZE_M, cfg.PRIORITY
@@ -5442,7 +5459,7 @@ def build_patches_with_splits_multi_fast(paths, polygons_gdf, cfg, resampling=Re
         sources = {ref_path: ref_src}
         for p in raster_paths_ordered[1:]:
             src = stack.enter_context(rasterio.open(p))
-            if mu._grids_match(src, ref_src):
+            if _grids_match(src, ref_src):
                 sources[p] = src
             else:
                 print(f"  note: {p} is on a different grid; resampling it on the fly (slow)")
@@ -5476,14 +5493,21 @@ def build_patches_with_splits_multi_fast(paths, polygons_gdf, cfg, resampling=Re
             for col in range(0, w - patch_size + 1, stride):
                 x_world, y_world = ref_src.xy(row + patch_size // 2, col + patch_size // 2)
                 patch_locations.append((row, col))
-                patch_blocks.append(mu.get_block_id(x_world, y_world, block_size_m))
-        block_to_split = mu.assign_blocks_to_splits(patch_blocks, train_frac, val_frac, seed)
+                patch_blocks.append(get_block_id(x_world, y_world, block_size_m))
+        hits_all = [sindex.query(box(*window_bounds(Window(c, r, patch_size, patch_size),
+                                                    ref_src.transform)))
+                    for r, c in patch_locations]
+        if label_aware_splits:
+            block_to_split = _label_aware_assignment(
+                patch_blocks, [len(x) > 0 for x in hits_all], gdf, class_col, block_size_m,
+                train_frac, val_frac, seed)
+        else:
+            block_to_split = assign_blocks_to_splits(patch_blocks, train_frac, val_frac, seed)
 
         n_checked = n_kept = 0
-        for (row, col), block in zip(patch_locations, patch_blocks):
+        for (row, col), block, hits in zip(patch_locations, patch_blocks, hits_all):
             window = Window(col, row, patch_size, patch_size)
             window_transform = ref_src.window_transform(window)
-            hits = sindex.query(box(*window_bounds(window, ref_src.transform)))
             if len(hits) == 0:
                 if require_labels:
                     continue
@@ -5507,7 +5531,7 @@ def build_patches_with_splits_multi_fast(paths, polygons_gdf, cfg, resampling=Re
             n_kept += 1
             yield {
                 'image': image, 'mask': mask, 'window': window, 'transform': window_transform,
-                'labeled_fraction': labeled_fraction, 'split': block_to_split[block],
+                'labeled_fraction': labeled_fraction, 'split': block_to_split.get(block, 'train'),
                 'block_id': block,
             }
         print(f"  patch positions: {len(patch_locations):,} total, {n_checked:,} near labels, "
