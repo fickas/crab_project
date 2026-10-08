@@ -5536,3 +5536,102 @@ def build_patches_with_splits_multi_fast(paths, polygons_gdf, cfg, resampling=No
             }
         print(f"  patch positions: {len(patch_locations):,} total, {n_checked:,} near labels, "
               f"{n_kept:,} kept")
+
+"""Put the MS-project DEM onto the pan grid WITH the same per-block geometric correction as the MS.
+
+The DEM delivered with the MS ortho comes from the same photogrammetric run, so it shares the MS
+geometry (up to ~37 cm off the pan in block 1) and its CRS label (EPSG:26986). Reprojecting would be
+wrong: the coordinates are already in the pan's frame apart from that misalignment. So, as for the MS:
+  1. relabel the DEM's CRS to the pan's (no resampling),
+  2. per survey block, warp it through the fitted correction model directly onto the pan grid,
+  3. mosaic the blocks and write one float32 GeoTIFF on the pan mosaic grid.
+Uses the models saved in coreg_state.pkl by the pansharpening pipeline.
+"""
+import os
+import pickle
+import shutil
+import numpy as np
+import rasterio
+from rasterio.windows import Window, from_bounds
+from osgeo import gdal
+
+gdal.UseExceptions()
+
+
+def _move_at(model, E, N):
+    X, Y = np.asarray(E, float) - model["center"][0], np.asarray(N, float) - model["center"][1]
+    cols = [np.ones_like(X)]
+    if model["order"] >= 1:
+        cols += [X, Y]
+    if model["order"] >= 2:
+        cols += [X * X, X * Y, Y * Y]
+    A = np.column_stack(cols)
+    return A @ model["cE"], A @ model["cN"]
+
+
+def correct_dem_to_pan_grid(dem_path, pan_path, coreg_state_path, out_path,
+                            work_dir="/content/dem_work", pad_m=2.0, n_grid=15,
+                            resampling="bilinear"):
+    os.makedirs(work_dir, exist_ok=True)
+    with open(coreg_state_path, "rb") as f:
+        st = pickle.load(f)
+    blocks, models = st["blocks"], st["models"]
+
+    with rasterio.open(dem_path) as d:
+        nd = d.nodata if d.nodata is not None else -32767.0
+        print(f"DEM: {d.width} x {d.height}, {d.res[0] * 100:.2f} cm, crs {d.crs}, nodata {d.nodata}")
+    with rasterio.open(pan_path) as p:
+        crs = p.crs.to_wkt()
+        print(f"pan grid: {p.width} x {p.height}, {p.res[0] * 100:.2f} cm, crs {p.crs}")
+
+    # 1. relabel the DEM's CRS (no resampling), declare nodata
+    relabeled = f"{work_dir}/dem_relabeled.vrt"
+    gdal.Translate(relabeled, dem_path, format="VRT", outputSRS=crs, noData=nd)
+
+    # 2. per block: GCP-polynomial warp of the DEM onto that block's window of the pan grid
+    block_vrts = []
+    for b, (l, bo, r, t) in blocks.items():
+        l, bo, r, t = l - pad_m, bo - pad_m, r + pad_m, t + pad_m
+        with rasterio.open(pan_path) as p:
+            win = from_bounds(l, bo, r, t, p.transform).round_offsets().round_lengths()
+            win = win.intersection(Window(0, 0, p.width, p.height))
+            ptr, W, H = p.window_transform(win), int(win.width), int(win.height)
+        with rasterio.open(relabeled) as m:
+            mp = pad_m + 1.0
+            mwin = from_bounds(l - mp, bo - mp, r + mp, t + mp, m.transform).round_offsets().round_lengths()
+            mwin = mwin.intersection(Window(0, 0, m.width, m.height))
+            mtr, mw, mh = m.window_transform(mwin), int(mwin.width), int(mwin.height)
+        cols, rows = np.meshgrid(np.linspace(0, mw, n_grid), np.linspace(0, mh, n_grid))
+        cols, rows = cols.ravel(), rows.ravel()
+        E = mtr.c + mtr.a * cols + mtr.b * rows
+        N = mtr.f + mtr.d * cols + mtr.e * rows
+        dE, dN = _move_at(models[b], E, N)
+        gcps = [gdal.GCP(float(e + de), float(n + dn), 0.0, float(c), float(r))
+                for e, n, de, dn, c, r in zip(E, N, dE, dN, cols, rows)]
+        gcp_vrt = f"{work_dir}/dem_block{b}_gcp.vrt"
+        gdal.Translate(gcp_vrt, relabeled, format="VRT",
+                       srcWin=[int(mwin.col_off), int(mwin.row_off), mw, mh], GCPs=gcps, outputSRS=crs)
+        bvrt = f"{work_dir}/dem_block{b}_corrected.vrt"
+        gdal.Warp(bvrt, gcp_vrt, format="VRT", polynomialOrder=max(1, models[b]["order"]),
+                  outputBounds=(ptr.c, ptr.f + ptr.e * H, ptr.c + ptr.a * W, ptr.f),
+                  width=W, height=H, dstSRS=crs, resampleAlg=resampling,
+                  srcNodata=nd, dstNodata=nd, outputType=gdal.GDT_Float32, multithread=True,
+                  warpOptions=["NUM_THREADS=ALL_CPUS"], warpMemoryLimit=2048)
+        block_vrts.append(bvrt)
+        print(f"block {b}: {['shift', 'affine', 'quadratic'][models[b]['order']]} correction, {W} x {H}")
+
+    # 3. mosaic the blocks onto the full pan grid and write one GeoTIFF
+    with rasterio.open(pan_path) as p:
+        pb = p.bounds
+        xres, yres = p.res
+    mos = f"{work_dir}/dem_mosaic.vrt"
+    gdal.BuildVRT(mos, block_vrts, outputBounds=(pb.left, pb.bottom, pb.right, pb.top),
+                  xRes=xres, yRes=yres, srcNodata=nd, VRTNodata=nd)
+    local_out = f"{work_dir}/{os.path.basename(out_path)}"
+    gdal.Translate(local_out, mos, format="GTiff", outputType=gdal.GDT_Float32, creationOptions=[
+        "TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=DEFLATE", "PREDICTOR=3",
+        "BIGTIFF=YES", "NUM_THREADS=ALL_CPUS"], callback=gdal.TermProgress_nocb)
+    if os.path.abspath(local_out) != os.path.abspath(out_path):
+        shutil.copy(local_out, out_path)
+    print("wrote", out_path)
+    return out_path
