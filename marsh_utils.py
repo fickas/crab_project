@@ -457,6 +457,7 @@ def compute_normalized_difference_raster(
             tiled=True,
             blockxsize=512,
             blockysize=512,
+            BIGTIFF='IF_SAFER'
         )
 
         with rasterio.open(output_path, 'w', **profile) as dst:
@@ -562,6 +563,7 @@ def _write_derived_raster(out_path, data, ref_src, dtype='float32'):
         compress='DEFLATE',
         predictor=3 if dtype.startswith('float') else 2,
         tiled=True, blockxsize=256, blockysize=256,
+        BIGTIFF='IF_SAFER'
     )
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
     with rasterio.open(out_path, 'w', **profile) as dst:
@@ -774,7 +776,7 @@ def ensure_channel_mask_from_ndwi(paths, ndwi_key='ndwi', threshold=0.0,
         profile = src.profile.copy()
         profile.update(count=1, dtype='uint8', nodata=255,
                        compress='LZW', predictor=2, tiled=True,
-                       blockxsize=256, blockysize=256)
+                       blockxsize=256, blockysize=256, BIGTIFF='IF_SAFER')
         os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
         with rasterio.open(out_path, 'w', **profile) as dst:
             dst.write(mask.astype(np.uint8), 1)
@@ -2270,6 +2272,7 @@ def predict_full_raster(
             blockxsize=256,
             blockysize=256,
             nodata=None,
+            BIGTIFF='IF_SAFER'
         )
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with rasterio.open(output_path, 'w', **profile) as dst:
