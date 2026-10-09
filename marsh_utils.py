@@ -5144,6 +5144,31 @@ def compute_savi_raster(src_path, out_path, red_band=3, nir_band=5, L=0.5):
         label="SAVI",
     )
 
+# ==== Paste into marsh_utils.py right AFTER the windowed compute_savi_raster ====
+# These replace the whole-raster compute_evi_raster and compute_ci_rededge_raster defined
+# earlier in the file (later definitions win, exactly as with SAVI). ensure_evi and
+# ensure_ci_rededge pick them up automatically. Output is identical to the originals.
+
+def compute_evi_raster(src_path, out_path, blue_band=1, red_band=3, nir_band=5,
+                       G=2.5, C1=6.0, C2=7.5, L=1.0):
+    """EVI = G * (NIR - R) / (NIR + C1*R - C2*B + L), windowed (tile by tile)."""
+    def fn(b):
+        denom = b['nir'] + C1 * b['red'] - C2 * b['blue'] + L
+        evi = G * (b['nir'] - b['red']) / denom
+        evi = np.where(np.abs(denom) < 1e-4, np.nan, evi)   # EVI blows up for very dark pixels
+        return np.clip(evi, -2.0, 2.0)
+    windowed_band_math(src_path, out_path, fn,
+                       in_bands={'blue': blue_band, 'red': red_band, 'nir': nir_band},
+                       label="EVI")
+
+
+def compute_ci_rededge_raster(src_path, out_path, re_band=4, nir_band=5):
+    """CIred-edge = NIR / RE - 1, windowed (tile by tile)."""
+    windowed_band_math(src_path, out_path,
+                       fn=lambda b: np.where(b['re'] > 1e-4, b['nir'] / b['re'] - 1.0, np.nan),
+                       in_bands={'re': re_band, 'nir': nir_band},
+                       label="CIred-edge")
+
 # ============================================================================
 # Windowed neighborhood (focal) operations for marsh_utils.
 # For ops that need surrounding pixels (TPI, local_std, laplacian, local_range,
