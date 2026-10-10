@@ -1364,10 +1364,13 @@ class MarshSegmentationDataset(Dataset):
     """
     Holds a list of patch dicts and serves (image_tensor, mask_tensor) pairs.
     Applies an albumentations pipeline if provided.
+    No-data pixels (NaN in any channel) are filled with the channel mean
+    (0 after normalization) and set to ignore_value so the loss skips them.
     """
-    def __init__(self, patches, augmentation=None):
+    def __init__(self, patches, augmentation=None, ignore_value=255):
         self.patches = patches
         self.augmentation = augmentation
+        self.ignore_value = ignore_value                      # new
 
     def __len__(self):
         return len(self.patches)
@@ -1382,6 +1385,13 @@ class MarshSegmentationDataset(Dataset):
             augmented = self.augmentation(image=image, mask=mask)
             image = augmented['image']
             mask = augmented['mask']
+
+        # new: no-data pixels -> channel mean (0 after normalization), excluded from the loss
+        bad = ~np.isfinite(image).all(axis=2)
+        if bad.any():
+            image = np.where(np.isfinite(image), image, 0.0).astype(np.float32)
+            mask = mask.copy()
+            mask[bad] = self.ignore_value
 
         # back to (C, H, W) tensor
         image_tensor = torch.from_numpy(image.transpose(2, 0, 1)).float()
