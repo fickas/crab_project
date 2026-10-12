@@ -5673,3 +5673,152 @@ def correct_dem_to_pan_grid(dem_path, pan_path, coreg_state_path, out_path,
         shutil.copy(local_out, out_path)
     print("wrote", out_path)
     return out_path
+
+"""Post-training error analysis for Model 1 (works on any split; use the TEST set for final numbers).
+
+analyze_errors      : one pass over a dataset -> confusion matrix, per-patch error rates,
+                      and error rate by distance to the nearest class boundary in the labels
+report              : per-class precision / recall / IoU, largest confusions, boundary-distance table,
+                      and a normalized confusion-matrix plot
+plot_error_map      : where the errors are: per-patch error rate on the map, and the worst blocks
+show_worst_patches  : pan / truth / prediction for the patches with the highest error rate
+
+`predict(xb)` is any function mapping a float32 batch (B, C, H, W) to class labels (B, H, W);
+see the notebook cell for the torch version. No torch import here.
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+from scipy import ndimage
+
+DIST_BINS_PX = [0, 2, 5, 10, 25, np.inf]       # distance-to-boundary bins, in pixels
+
+
+def _names(class_names, K):
+    return [class_names[k] for k in range(K)] if class_names is not None else [str(k) for k in range(K)]
+
+
+def _boundary_distance(y, ignore):
+    """Distance (px) from each pixel to the nearest boundary between two LABELED classes."""
+    lab = y != ignore
+    b = np.zeros(y.shape, bool)
+    h = (y[:, 1:] != y[:, :-1]) & lab[:, 1:] & lab[:, :-1]
+    v = (y[1:, :] != y[:-1, :]) & lab[1:, :] & lab[:-1, :]
+    b[:, 1:] |= h; b[:, :-1] |= h; b[1:, :] |= v; b[:-1, :] |= v
+    if not b.any():
+        return np.full(y.shape, np.inf)
+    return ndimage.distance_transform_edt(~b)
+
+
+def analyze_errors(ds, predict, n_classes, ignore=255, batch=16):
+    K, nb = n_classes, len(DIST_BINS_PX) - 1
+    cm = np.zeros((K, K), np.int64)
+    per_patch = np.full((len(ds), 2), np.nan)          # (error rate, labeled pixels)
+    bin_tot, bin_err = np.zeros(nb), np.zeros(nb)
+    for i0 in range(0, len(ds), batch):
+        idx = list(range(i0, min(i0 + batch, len(ds))))
+        items = [ds[i] for i in idx]
+        x = np.stack([np.asarray(a, dtype=np.float32) for a, _ in items])
+        preds = predict(x)
+        for i, (_, y), p in zip(idx, items, preds):
+            y = np.asarray(y)
+            m = y != ignore
+            if not m.any():
+                continue
+            yt, pt = y[m].astype(np.int64), np.asarray(p)[m].astype(np.int64)
+            cm += np.bincount(K * yt + pt, minlength=K * K).reshape(K, K)
+            wrong = (yt != pt)
+            per_patch[i] = (wrong.mean(), m.sum())
+            k = np.digitize(_boundary_distance(y, ignore)[m], DIST_BINS_PX[1:-1])
+            bin_tot += np.bincount(k, minlength=nb)
+            bin_err += np.bincount(k, weights=wrong, minlength=nb)
+        if (i0 // batch) % 20 == 0:
+            print(f"  {min(i0 + batch, len(ds))}/{len(ds)} patches")
+    return dict(cm=cm, per_patch=per_patch, bin_tot=bin_tot, bin_err=bin_err)
+
+
+def report(res, class_names=None, px_cm=0.93, show_plot=True):
+    cm = res["cm"]; K = len(cm); names = _names(class_names, K)
+    tp = np.diag(cm).astype(float); fn = cm.sum(1) - tp; fp = cm.sum(0) - tp
+    prec = tp / np.maximum(tp + fp, 1); rec = tp / np.maximum(tp + fn, 1); iou = tp / np.maximum(tp + fp + fn, 1)
+    print(f"{'class':20s} {'precision':>9s} {'recall':>7s} {'IoU':>6s} {'true pixels':>13s}")
+    for k in range(K):
+        print(f"{names[k]:20s} {prec[k]:9.3f} {rec[k]:7.3f} {iou[k]:6.3f} {int(cm[k].sum()):13,d}")
+    print(f"{'overall':20s} pixel accuracy {tp.sum() / cm.sum():.3f}   mIoU {iou.mean():.3f}\n")
+
+    rown = cm / np.maximum(cm.sum(1, keepdims=True), 1)
+    off = sorted(((rown[i, j], i, j) for i in range(K) for j in range(K) if i != j), reverse=True)
+    print("largest confusions (share of a true class predicted as another):")
+    for s, i, j in off[:6]:
+        print(f"  {names[i]:>18s} -> {names[j]:<18s} {s:6.1%}")
+
+    print("\nerror rate by distance to the nearest class boundary in the labels:")
+    edges = DIST_BINS_PX
+    for b in range(len(edges) - 1):
+        lo, hi = edges[b] * px_cm, edges[b + 1] * px_cm
+        rng = f"{lo:4.0f}-{hi:3.0f} cm" if np.isfinite(hi) else f"  >{lo:3.0f} cm   "
+        tot = res["bin_tot"][b]
+        if tot:
+            print(f"  {rng}: {res['bin_err'][b] / tot:6.1%} wrong  ({tot / res['bin_tot'].sum():5.1%} of labeled pixels)")
+
+    if show_plot:
+        fig, ax = plt.subplots(figsize=(7.5, 6.5))
+        im = ax.imshow(rown, cmap="Blues", vmin=0, vmax=1)
+        for i in range(K):
+            for j in range(K):
+                ax.text(j, i, f"{rown[i, j]:.2f}", ha="center", va="center",
+                        color="white" if rown[i, j] > 0.5 else "black", fontsize=9)
+        ax.set_xticks(range(K)); ax.set_xticklabels(names, rotation=40, ha="right")
+        ax.set_yticks(range(K)); ax.set_yticklabels(names)
+        ax.set_xlabel("predicted"); ax.set_ylabel("true"); ax.set_title("confusion matrix (rows sum to 1 = recall)")
+        plt.colorbar(im, ax=ax, fraction=0.046); plt.tight_layout(); plt.show()
+    return dict(precision=prec, recall=rec, iou=iou)
+
+
+def plot_error_map(res, patches, patch_size, block_size_m=None, n_worst_blocks=5):
+    pp = res["per_patch"]
+    centers = np.array([p["transform"] * (patch_size / 2, patch_size / 2) for p in patches])
+    ok = ~np.isnan(pp[:, 0])
+    fig, ax = plt.subplots(figsize=(8, 8))
+    s = ax.scatter(centers[ok, 0], centers[ok, 1], c=pp[ok, 0], s=6, cmap="magma_r", vmin=0, vmax=1)
+    ax.set_aspect("equal"); ax.set_title("error rate per patch (labeled pixels)")
+    plt.colorbar(s, ax=ax, fraction=0.046, label="share wrong"); plt.tight_layout(); plt.show()
+
+    if block_size_m and "block_id" in patches[0]:
+        agg = {}
+        for p, (e, n) in zip(patches, pp):
+            if np.isnan(e):
+                continue
+            a = agg.setdefault(p["block_id"], [0.0, 0.0]); a[0] += e * n; a[1] += n
+        rows = sorted(((v[0] / v[1], v[1], b) for b, v in agg.items()), reverse=True)
+        print(f"worst {min(n_worst_blocks, len(rows))} of {len(rows)} blocks (centre coordinates, to find them in QGIS):")
+        for e, n, b in rows[:n_worst_blocks]:
+            cx, cy = (b[0] + 0.5) * block_size_m, (b[1] + 0.5) * block_size_m
+            print(f"  block {b}: {e:6.1%} wrong over {int(n):,d} labeled px  -> centre E {cx:.0f}, N {cy:.0f}")
+
+
+def show_worst_patches(res, ds, patches, predict, class_names=None, n=4,
+                       min_labeled_frac=0.2, ignore=255):
+    pp = res["per_patch"]; ps = patches[0]["mask"].shape[0]
+    K = len(res["cm"]); names = _names(class_names, K)
+    ok = pp[:, 1] >= min_labeled_frac * ps * ps
+    order = [i for i in np.argsort(-np.nan_to_num(pp[:, 0], nan=-1)) if ok[i]][:n]
+    cmap = ListedColormap(plt.cm.tab10.colors[:K])
+    fig, ax = plt.subplots(len(order), 3, figsize=(13, 4.3 * len(order)), squeeze=False)
+    for r, i in enumerate(order):
+        x, y = ds[i]
+        y = np.asarray(y)
+        p = np.asarray(predict(np.asarray(x, dtype=np.float32)[None]))[0]
+        cx, cy = patches[i]["transform"] * (ps / 2, ps / 2)
+        ax[r, 0].imshow(patches[i]["image"][0], cmap="gray")
+        ax[r, 0].set_title(f"pan  (E {cx:.0f}, N {cy:.0f})")
+        ax[r, 1].imshow(np.ma.masked_equal(y, ignore), cmap=cmap, vmin=-0.5, vmax=K - 0.5, interpolation="nearest")
+        ax[r, 1].set_title("truth")
+        ax[r, 2].imshow(np.ma.masked_where(y == ignore, p), cmap=cmap, vmin=-0.5, vmax=K - 0.5, interpolation="nearest")
+        ax[r, 2].set_title(f"prediction  ({pp[i, 0]:.0%} wrong)")
+        for a in ax[r]:
+            a.axis("off")
+    fig.legend(handles=[Patch(color=cmap(k), label=names[k]) for k in range(K)],
+               loc="lower center", ncol=K, frameon=False)
+    plt.tight_layout(rect=(0, 0.03, 1, 1)); plt.show()
